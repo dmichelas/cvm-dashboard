@@ -1,0 +1,129 @@
+* { box-sizing: border-box; }
+
+.viz-root {
+  color-scheme: light;
+  --surface-1:      #fcfcfb;
+  --page:           #f9f9f7;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --gridline:       #e1e0d9;
+  --baseline:       #c3c2b7;
+  --border:         rgba(11,11,11,0.10);
+
+  --buy:            #2a78d6; /* blue: compra */
+  --sell:           #e34948; /* red: venda */
+
+  --role-1: #2a78d6; /* Diretor */
+  --role-2: #1baf7a; /* Conselho de Administração */
+  --role-3: #eda100; /* Conselho Fiscal */
+  --role-4: #008300; /* Controlador */
+  --role-5: #4a3aa7; /* Órgão Estatutário */
+
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--text-primary);
+  background: var(--page);
+  min-height: 100vh;
+  padding: 24px 20px 60px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --buy:            #3987e5;
+    --sell:           #e66767;
+    --role-1: #3987e5;
+    --role-2: #199e70;
+    --role-3: #c98500;
+    --role-4: #008300;
+    --role-5: #9085e9;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-1:      #1a1a19;
+  --page:           #0d0d0d;
+  --text-primary:   #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted:     #898781;
+  --gridline:       #2c2c2a;
+  --baseline:       #383835;
+  --border:         rgba(255,255,255,0.10);
+  --buy:            #3987e5;
+  --sell:           #e66767;
+  --role-1: #3987e5;
+  --role-2: #199e70;
+  --role-3: #c98500;
+  --role-4: #008300;
+  --role-5: #9085e9;
+}
+
+.app-header { max-width: 760px; margin: 0 auto 20px; text-align: center; }
+.app-header h1 { margin: 0 0 6px; font-size: 26px; }
+.subtitle { margin: 0; color: var(--text-secondary); font-size: 14px; }
+
+.search-wrap { max-width: 560px; margin: 0 auto; position: relative; }
+#search {
+  width: 100%; padding: 12px 14px; font-size: 15px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+}
+.search-results {
+  position: absolute; top: 100%; left: 0; right: 0; margin-top: 6px;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  max-height: 320px; overflow-y: auto; z-index: 10; box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+}
+.result-row { padding: 10px 14px; cursor: pointer; display: flex; justify-content: space-between; gap: 12px; }
+.result-row:hover { background: var(--page); }
+.result-row .name { font-size: 14px; }
+.result-row .tickers { color: var(--text-secondary); font-size: 13px; white-space: nowrap; }
+
+.company-panel { max-width: 760px; margin: 32px auto 0; }
+.company-title h2 { margin: 0 0 6px; font-size: 20px; }
+.ticker-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 20px; }
+.ticker-chip {
+  font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 28px; }
+.stat-tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+.stat-tile .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+.stat-tile .value { font-size: 22px; font-weight: 600; }
+.stat-tile .value.buy { color: var(--buy); }
+.stat-tile .value.sell { color: var(--sell); }
+
+.chart-section { margin-bottom: 32px; }
+.chart-section h3 { font-size: 15px; margin: 0 0 4px; }
+.chart { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+.empty-note { color: var(--text-muted); font-size: 13px; padding: 8px 4px; }
+
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-secondary); margin-bottom: 10px; }
+.legend-item { display: flex; align-items: center; gap: 6px; }
+.legend-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+.bar-tooltip {
+  position: absolute; pointer-events: none; background: var(--text-primary); color: var(--surface-1);
+  font-size: 12px; padding: 6px 9px; border-radius: 6px; white-space: nowrap; transform: translate(-50%, -110%);
+  opacity: 0; transition: opacity 0.1s;
+}
+.bar-tooltip.visible { opacity: 1; }
+
+.role-breakdown { display: flex; flex-direction: column; gap: 10px; }
+.role-row { display: grid; grid-template-columns: 170px 1fr 90px; align-items: center; gap: 10px; font-size: 13px; }
+.role-row .role-label { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); }
+.role-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.role-track { position: relative; height: 10px; background: var(--gridline); border-radius: 999px; }
+.role-fill { position: absolute; top: 0; bottom: 0; border-radius: 999px; }
+.role-value { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-primary); }
+
+.meta-note { text-align: center; color: var(--text-muted); font-size: 12px; margin-top: 40px; }
+
+.bar-col { fill: var(--buy); }

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CVM Insider &amp; Buyback Tracker</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="viz-root">
+  <header class="app-header">
+    <h1>Insiders &amp; Buybacks</h1>
+    <p class="subtitle">Negociação de valores mobiliários por administradores, controladores e pela própria companhia &mdash; dados abertos CVM</p>
+  </header>
+
+  <div class="search-wrap">
+    <input id="search" type="text" placeholder="Buscar empresa ou ticker (ex: PETR4, Vale, Itaú)…" autocomplete="off">
+    <div id="results" class="search-results" hidden></div>
+  </div>
+
+  <main id="panel" class="company-panel" hidden>
+    <div class="company-title">
+      <h2 id="company-name"></h2>
+      <div id="company-tickers" class="ticker-row"></div>
+    </div>
+
+    <section class="stat-row" id="stat-row"></section>
+
+    <section class="chart-section">
+      <h3>Recompra de ações pela companhia (buybacks)</h3>
+      <div id="buyback-chart" class="chart"></div>
+      <div id="buyback-empty" class="empty-note" hidden>Sem movimentações de compra/venda própria no período.</div>
+    </section>
+
+    <section class="chart-section">
+      <h3>Negociação de administradores e pessoas ligadas (ações)</h3>
+      <div id="insider-chart" class="chart"></div>
+      <div id="insider-empty" class="empty-note" hidden>Sem movimentações de administradores no período.</div>
+    </section>
+
+    <section class="chart-section">
+      <h3>Saldo por cargo (últimos 24 meses)</h3>
+      <div id="role-breakdown" class="role-breakdown"></div>
+    </section>
+  </main>
+
+  <p id="meta-note" class="meta-note"></p>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
