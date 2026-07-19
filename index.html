@@ -31,6 +31,7 @@
         <button id="month-picker-btn" class="filter-btn" type="button"></button>
         <div id="month-picker-panel" class="month-picker-panel" hidden></div>
       </div>
+      <select id="role-filter" class="filter-btn"></select>
       <input id="ticker-filter" type="text" class="filter-btn ticker-filter-input" placeholder="Filtrar por ticker…" autocomplete="off">
       <label class="group-toggle">
         <input id="group-toggle" type="checkbox">
@@ -71,7 +72,10 @@
     </section>
 
     <section class="chart-section">
-      <h3>Negociação de administradores e pessoas ligadas (ações)</h3>
+      <div class="chart-section-head">
+        <h3>Negociação de administradores e pessoas ligadas (ações)</h3>
+        <select id="chart-role-filter" class="filter-btn filter-btn-small"></select>
+      </div>
       <div id="insider-chart" class="chart"></div>
       <div id="insider-empty" class="empty-note" hidden>Sem movimentações de administradores no período.</div>
     </section>

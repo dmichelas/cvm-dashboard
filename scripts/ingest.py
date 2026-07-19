@@ -90,22 +90,53 @@ def fetch_url(url: str, retries: int = 3) -> bytes:
     raise last_err
 
 
-def compute_monthly(records: list[dict]) -> dict:
+# The 5 insider role categories CVM's VLMO form reports (Tipo_Cargo), mapped
+# to short keys used in the JSON output. "orgaos_tecnicos" is what CVM's own
+# PDF form calls "Órgãos Técnicos ou Consultivos" -- the CSV's Tipo_Cargo
+# spells the same category "Órgão Estatutário ou Vinculado".
+ROLE_KEYS = {
+    "Controlador ou Vinculado": "controlador",
+    "Conselho de Administração ou Vinculado": "conselho_administracao",
+    "Diretor ou Vinculado": "diretoria",
+    "Conselho Fiscal ou Vinculado": "conselho_fiscal",
+    "Órgão Estatutário ou Vinculado": "orgaos_tecnicos",
+}
+
+
+def _aggregate_records(records: list[dict]) -> dict:
+    """Sums signed qty/value plus gross (unsigned) qty/value for Preço Médio
+    (see monthly_dict_to_rows for why net/net can blow up), rejecting price
+    outliers first: CVM's source filings occasionally have a fat-finger
+    data-entry error (verified case: one entity's rows for a single month
+    priced some trades at R$1,242/share against a R$12-14 range the same
+    week -- the Volume field was internally consistent with that bad price,
+    confirming it's a source error, not a parsing bug). A row priced more
+    than 5x off the group's median is dropped; a stock's price realistically
+    never moves that much within one month, so this only catches genuine
+    data-entry errors.
+    """
+    priced = [r["price"] for r in records if r.get("price")]
+    med = statistics.median(priced) if priced else None
+    good = [r for r in records if not r.get("price") or med is None or 0.2 <= r["price"] / med <= 5]
+
+    qty = val = gross_qty = gross_val = 0.0
+    for r in good:
+        q, v = r.get("qty") or 0.0, r.get("volume") or 0.0
+        sign = 1.0 if r["movement"].startswith("Compra") else -1.0
+        qty += sign * q
+        val += sign * v
+        gross_qty += q
+        gross_val += v
+    return {"qty": qty, "val": val, "gross_qty": gross_qty, "gross_val": gross_val}
+
+
+def compute_monthly(records: list[dict], by_role: bool = False) -> dict:
     """Groups a company's trade records by month and aggregates qty/value.
 
-    Rejects per-row price outliers before aggregating: CVM's source filings
-    occasionally have a fat-finger data-entry error (verified case: one
-    entity's rows for a single month priced some trades at R$1,242/share
-    against a R$12-14 range the same week -- the Volume field was
-    internally consistent with that bad price, confirming it's a source
-    error, not a parsing bug). A row priced more than 5x off the month's
-    median is dropped from the aggregate; a stock's price realistically
-    never moves that much within one month, so this only ever catches
-    genuine data-entry errors.
-
-    Gross (unsigned) sums are kept alongside the signed net so Preço Médio
-    can be computed as total value / total quantity -- see the comment in
-    monthly_dict_to_rows for why the naive net/net ratio can blow up.
+    If by_role, each month's entry also gets a "by_role" dict (see ROLE_KEYS)
+    with the same aggregate computed separately per insider role category --
+    a company can be net-flat overall in a month while a specific role was
+    clearly buying or selling, and that's exactly the case this is for.
     """
     by_month: dict[str, list[dict]] = {}
     for r in records:
@@ -115,20 +146,20 @@ def compute_monthly(records: list[dict]) -> dict:
 
     result = {}
     for month, recs in by_month.items():
-        priced = [r["price"] for r in recs if r.get("price")]
-        med = statistics.median(priced) if priced else None
-        good = [r for r in recs if not r.get("price") or med is None or 0.2 <= r["price"] / med <= 5]
-
-        qty = val = gross_qty = gross_val = 0.0
-        for r in good:
-            q, v = r.get("qty") or 0.0, r.get("volume") or 0.0
-            sign = 1.0 if r["movement"].startswith("Compra") else -1.0
-            qty += sign * q
-            val += sign * v
-            gross_qty += q
-            gross_val += v
-        if qty:
-            result[month] = {"qty": qty, "val": val, "gross_qty": gross_qty, "gross_val": gross_val}
+        agg = _aggregate_records(recs)
+        roles = {}
+        if by_role:
+            for role_name, role_key in ROLE_KEYS.items():
+                role_recs = [r for r in recs if r.get("role") == role_name]
+                if not role_recs:
+                    continue
+                role_agg = _aggregate_records(role_recs)
+                if role_agg["qty"]:
+                    roles[role_key] = role_agg
+        if agg["qty"] or roles:
+            if roles:
+                agg["by_role"] = roles
+            result[month] = agg
     return result
 
 
@@ -322,7 +353,7 @@ def load_transactions() -> dict[str, dict]:
             company["insiders"].append(record)
 
     for company in companies.values():
-        company["monthly"] = compute_monthly(company["insiders"])
+        company["monthly"] = compute_monthly(company["insiders"], by_role=True)
     return companies
 
 
@@ -336,29 +367,40 @@ def _num(value: str):
         return None
 
 
+def _monthly_row(agg: dict, cnpj_digits: str, name: str, company_tickers: list[str], month: str, total_shares, role: str = None) -> dict:
+    qty, val = agg["qty"], agg["val"]
+    gross_qty, gross_val = agg["gross_qty"], agg["gross_val"]
+    row = {
+        "cnpj_digits": cnpj_digits,
+        "name": name,
+        "tickers": company_tickers,
+        "month": month,
+        "qty": qty,
+        "val": val,
+        "gross_qty": gross_qty,
+        "gross_val": gross_val,
+        "price": gross_val / gross_qty if gross_qty else 0,
+    }
+    if role:
+        row["role"] = role
+    if total_shares is not None:
+        shares = total_shares.get(cnpj_digits)
+        row["pct"] = abs(qty) / shares * 100 if shares else None
+    return row
+
+
 def monthly_dict_to_rows(monthly: dict, cnpj_digits: str, name: str, company_tickers: list[str], months_seen: set, total_shares=None):
+    """One row per (month) for the aggregate (unchanged shape), plus one more
+    row per (month, role) when compute_monthly was run with by_role=True --
+    the ranking table's role toggle filters on that "role" field, defaulting
+    to the roleless aggregate rows when no role is selected."""
     rows = []
     for month, agg in monthly.items():
         months_seen.add(month)
-        qty, val = agg["qty"], agg["val"]
-        gross_qty, gross_val = agg["gross_qty"], agg["gross_val"]
-        if not qty:
-            continue
-        row = {
-            "cnpj_digits": cnpj_digits,
-            "name": name,
-            "tickers": company_tickers,
-            "month": month,
-            "qty": qty,
-            "val": val,
-            "gross_qty": gross_qty,
-            "gross_val": gross_val,
-            "price": gross_val / gross_qty if gross_qty else 0,
-        }
-        if total_shares is not None:
-            shares = total_shares.get(cnpj_digits)
-            row["pct"] = abs(qty) / shares * 100 if shares else None
-        rows.append(row)
+        if agg["qty"]:
+            rows.append(_monthly_row(agg, cnpj_digits, name, company_tickers, month, total_shares))
+        for role_key, role_agg in agg.get("by_role", {}).items():
+            rows.append(_monthly_row(role_agg, cnpj_digits, name, company_tickers, month, total_shares, role=role_key))
     return rows
 
 

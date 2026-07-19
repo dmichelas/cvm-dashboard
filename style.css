@@ -105,6 +105,9 @@
 
 .chart-section { margin-bottom: 32px; }
 .chart-section h3 { font-size: 15px; margin: 0 0 4px; }
+.chart-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.chart-section-head h3 { flex: 1; min-width: 200px; }
+.filter-btn-small { padding: 5px 8px; font-size: 12px; }
 .chart { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
 .empty-note { color: var(--text-muted); font-size: 13px; padding: 8px 4px; }
 

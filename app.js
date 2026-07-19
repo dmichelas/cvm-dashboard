@@ -68,8 +68,25 @@ const ROLE_LABELS = {
   "Conselho de Administração ou Vinculado": "Conselho de Administração",
   "Conselho Fiscal ou Vinculado": "Conselho Fiscal",
   "Controlador ou Vinculado": "Controlador",
-  "Órgão Estatutário ou Vinculado": "Órgão Estatutário",
+  "Órgão Estatutário ou Vinculado": "Órgãos Técnicos ou Consultivos",
 };
+
+// Short keys mirror ingest.py's ROLE_KEYS (used by the pre-aggregated
+// monthly.json rows) mapped back to the full CVM role string (used to
+// filter raw per-trade records for the per-company chart).
+const ROLE_KEY_TO_FULL = {
+  controlador: "Controlador ou Vinculado",
+  conselho_administracao: "Conselho de Administração ou Vinculado",
+  diretoria: "Diretor ou Vinculado",
+  conselho_fiscal: "Conselho Fiscal ou Vinculado",
+  orgaos_tecnicos: "Órgão Estatutário ou Vinculado",
+};
+const ROLE_TOGGLE_ORDER = ["controlador", "conselho_administracao", "diretoria", "conselho_fiscal", "orgaos_tecnicos"];
+
+function populateRoleSelect(select) {
+  select.innerHTML = `<option value="">Todos os cargos</option>` +
+    ROLE_TOGGLE_ORDER.map(key => `<option value="${key}">${ROLE_LABELS[ROLE_KEY_TO_FULL[key]]}</option>`).join("");
+}
 
 function direction(movement) {
   if (movement.startsWith("Compra")) return "buy";
@@ -85,16 +102,32 @@ function median(nums) {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
+// Rounds a chart axis max up to a "nice" step (e.g. 534,917 -> 600,000)
+// instead of showing the exact data value as the axis label. Uses a finer
+// step table than the usual 1/2/5 so the axis doesn't overshoot too far
+// past the real max (1/2/5 would round 534,917 all the way to 1,000,000).
+const NICE_STEPS = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+function niceCeil(value) {
+  if (value <= 0) return 1;
+  const exponent = Math.floor(Math.log10(value));
+  const fraction = value / Math.pow(10, exponent);
+  const niceFraction = NICE_STEPS.find(s => s >= fraction) || 10;
+  return niceFraction * Math.pow(10, exponent);
+}
+
 // allMonths: the full known month range (rankingMeta.available_months) so
 // the chart shows every past month, not just ones with activity, and a
 // company with a data gap doesn't read as having a shorter history.
-function monthlyAggregate(records, allMonths) {
+// roleFilter: full CVM role string to restrict to (see ROLE_KEY_TO_FULL),
+// or falsy for every role combined.
+function monthlyAggregate(records, allMonths, roleFilter) {
   const byMonth = new Map();
   for (const month of allMonths) byMonth.set(month, { month, buy: 0, sell: 0, grossQty: 0, grossVal: 0, price: null });
 
   const rowsByMonth = new Map();
   for (const r of records) {
     if (!r.is_trade || !SHARE_ASSETS.has(r.asset)) continue;
+    if (roleFilter && r.role !== roleFilter) continue;
     const dir = direction(r.movement);
     const month = (r.ref || "").slice(0, 7);
     if (!dir || !byMonth.has(month)) continue;
@@ -136,17 +169,26 @@ function roleAggregate(records) {
 
 function fmtCompact(n) {
   const abs = Math.abs(n);
-  if (abs >= 1e9) return (n / 1e9).toFixed(1) + "B";
-  if (abs >= 1e6) return (n / 1e6).toFixed(1) + "M";
-  if (abs >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  const trim = s => s.replace(/\.0$/, "");
+  if (abs >= 1e9) return trim((n / 1e9).toFixed(1)) + "B";
+  if (abs >= 1e6) return trim((n / 1e6).toFixed(1)) + "M";
+  if (abs >= 1e3) return trim((n / 1e3).toFixed(1)) + "K";
   return Math.round(n).toLocaleString("pt-BR");
 }
+
+let currentCompanyData = null;
+const chartRoleFilter = document.getElementById("chart-role-filter");
+populateRoleSelect(chartRoleFilter);
+chartRoleFilter.addEventListener("change", () => renderInsiderChart());
 
 function renderCompany(data) {
   panel.hidden = false;
   document.getElementById("company-name").textContent = data.name;
   const tickerRow = document.getElementById("company-tickers");
   tickerRow.innerHTML = data.tickers.map(t => `<span class="ticker-chip">${t}</span>`).join("");
+
+  currentCompanyData = data;
+  chartRoleFilter.value = "";
 
   const allMonths = rankingMeta.available_months;
   const buybackMonthly = monthlyAggregate(data.buybacks, allMonths);
@@ -155,8 +197,16 @@ function renderCompany(data) {
 
   renderStats(buybackMonthly, insiderMonthly);
   renderDivergingChart("buyback-chart", "buyback-empty", buybackMonthly);
-  renderDivergingChart("insider-chart", "insider-empty", insiderMonthly);
+  renderInsiderChart();
   renderRoleBreakdown(roleTotals);
+}
+
+function renderInsiderChart() {
+  if (!currentCompanyData) return;
+  const allMonths = rankingMeta.available_months;
+  const roleFull = ROLE_KEY_TO_FULL[chartRoleFilter.value] || null;
+  const insiderMonthly = monthlyAggregate(currentCompanyData.insiders, allMonths, roleFull);
+  renderDivergingChart("insider-chart", "insider-empty", insiderMonthly);
 }
 
 function renderStats(buybackMonthly, insiderMonthly) {
@@ -194,7 +244,7 @@ function renderDivergingChart(containerId, emptyId, monthly) {
   const plotH = height - padT - padB;
   const midY = padT + plotH / 2;
 
-  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.buy, m.sell)));
+  const maxVal = niceCeil(Math.max(1, ...monthly.map(m => Math.max(m.buy, m.sell))));
   const scale = (plotH / 2 - 6) / maxVal;
   const barW = Math.min(10, plotW / monthly.length * 0.55);
   const step = plotW / monthly.length;
@@ -368,6 +418,7 @@ let rankingDatasets = { insiders: [], buybacks: [] };
 let activeTab = "insiders";
 let selectedMonths = new Set();
 let rankingTickerFilter = "";
+let selectedRole = "";
 let groupByTicker = false;
 let sortKey = "val";
 let sortDir = "desc";
@@ -388,6 +439,7 @@ const TAB_INFO = {
 
 const monthBtn = document.getElementById("month-picker-btn");
 const monthPanel = document.getElementById("month-picker-panel");
+const roleFilterSelect = document.getElementById("role-filter");
 const tickerFilterInput = document.getElementById("ticker-filter");
 const groupToggle = document.getElementById("group-toggle");
 const rankingTbody = document.getElementById("ranking-tbody");
@@ -412,6 +464,11 @@ function initRanking(meta, monthly, bbMonthly) {
   selectedMonths = new Set([initial]);
   pickerYear = Number(initial.slice(0, 4));
 
+  populateRoleSelect(roleFilterSelect);
+  roleFilterSelect.addEventListener("change", () => {
+    selectedRole = roleFilterSelect.value;
+    renderRanking();
+  });
   tickerFilterInput.addEventListener("input", () => {
     rankingTickerFilter = norm(tickerFilterInput.value.trim());
     renderRanking();
@@ -449,6 +506,7 @@ function switchTab(tab) {
   tabBuybacksBtn.classList.toggle("active", tab === "buybacks");
   rankingTitle.textContent = TAB_INFO[tab].title;
   rankingSubtitle.textContent = TAB_INFO[tab].subtitle;
+  roleFilterSelect.hidden = tab !== "insiders"; // role breakdown only applies to insiders
   // Each dataset can have different real coverage (e.g. CVM briefly serving
   // a 404 on one source file left buybacks lagging insiders by several
   // months) -- default to this tab's own latest month, not a shared one.
@@ -575,6 +633,7 @@ function buildRankingRows() {
   const hasPct = TAB_INFO[activeTab].hasPct;
   const filtered = dataset.filter(r => {
     if (!selectedMonths.has(r.month)) return false;
+    if (activeTab === "insiders" && (r.role || "") !== selectedRole) return false;
     if (rankingTickerFilter) {
       const hay = norm(r.name) + " " + r.tickers.map(norm).join(" ");
       if (!hay.includes(rankingTickerFilter)) return false;
