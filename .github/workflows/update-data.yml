@@ -16,10 +16,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: pip install -r requirements.txt
       - run: python scripts/ingest.py
       - run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/companies.json data/meta.json data/by_company
+          git add data/companies.json data/meta.json data/by_company data/monthly.json data/bb_monthly.json
           git diff --cached --quiet || git commit -m "Update CVM data"
           git push

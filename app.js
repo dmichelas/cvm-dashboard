@@ -11,10 +11,11 @@ fetch("data/companies.json")
 Promise.all([
   fetch("data/meta.json").then(r => r.json()),
   fetch("data/monthly.json").then(r => r.json()),
-]).then(([meta, monthly]) => {
+  fetch("data/bb_monthly.json").then(r => r.json()),
+]).then(([meta, monthly, bbMonthly]) => {
   document.getElementById("meta-note").textContent =
     `Dados CVM (${meta.years.join(", ")}) · ${meta.company_count} companhias · atualizado em ${meta.generated_at.slice(0, 10)}`;
-  initRanking(meta, monthly);
+  initRanking(meta, monthly, bbMonthly);
 });
 
 function norm(s) {
@@ -292,13 +293,27 @@ function renderRoleBreakdown(roleTotals) {
 /* --- Ranking: top insider purchases, filterable like carteirafundos.com --- */
 
 let rankingMeta = null;
-let rankingMonthly = [];
+let rankingDatasets = { insiders: [], buybacks: [] };
+let activeTab = "insiders";
 let selectedMonths = new Set();
 let rankingTickerFilter = "";
 let groupByTicker = false;
 let sortKey = "val";
 let sortDir = "desc";
 let pickerYear = null;
+
+const TAB_INFO = {
+  insiders: {
+    title: "Top compras de insiders",
+    subtitle: "Negociação de administradores e pessoas ligadas — dados abertos CVM",
+    hasPct: false,
+  },
+  buybacks: {
+    title: "Top recompras",
+    subtitle: "Negociação de valores mobiliários pela própria companhia, suas controladas e coligadas — dados abertos CVM",
+    hasPct: true,
+  },
+};
 
 const monthBtn = document.getElementById("month-picker-btn");
 const monthPanel = document.getElementById("month-picker-panel");
@@ -307,10 +322,15 @@ const groupToggle = document.getElementById("group-toggle");
 const rankingTbody = document.getElementById("ranking-tbody");
 const rankingTable = document.getElementById("ranking-table");
 const rankingEmpty = document.getElementById("ranking-empty");
+const rankingTitle = document.getElementById("ranking-title");
+const rankingSubtitle = document.getElementById("ranking-subtitle");
+const tabInsidersBtn = document.getElementById("tab-insiders");
+const tabBuybacksBtn = document.getElementById("tab-buybacks");
 
-function initRanking(meta, monthly) {
+function initRanking(meta, monthly, bbMonthly) {
   rankingMeta = meta;
-  rankingMonthly = monthly;
+  rankingDatasets.insiders = monthly;
+  rankingDatasets.buybacks = bbMonthly;
   selectedMonths = new Set([meta.last_complete_month]);
   pickerYear = Number(meta.last_complete_month.slice(0, 4));
 
@@ -337,8 +357,20 @@ function initRanking(meta, monthly) {
       renderRanking();
     });
   });
+  tabInsidersBtn.addEventListener("click", () => switchTab("insiders"));
+  tabBuybacksBtn.addEventListener("click", () => switchTab("buybacks"));
 
   updateMonthBtnLabel();
+  renderRanking();
+}
+
+function switchTab(tab) {
+  if (activeTab === tab) return;
+  activeTab = tab;
+  tabInsidersBtn.classList.toggle("active", tab === "insiders");
+  tabBuybacksBtn.classList.toggle("active", tab === "buybacks");
+  rankingTitle.textContent = TAB_INFO[tab].title;
+  rankingSubtitle.textContent = TAB_INFO[tab].subtitle;
   renderRanking();
 }
 
@@ -450,7 +482,9 @@ function fmtPrice(n) {
 }
 
 function buildRankingRows() {
-  const filtered = rankingMonthly.filter(r => {
+  const dataset = rankingDatasets[activeTab];
+  const hasPct = TAB_INFO[activeTab].hasPct;
+  const filtered = dataset.filter(r => {
     if (!selectedMonths.has(r.month)) return false;
     if (rankingTickerFilter) {
       const hay = norm(r.name) + " " + r.tickers.map(norm).join(" ");
@@ -463,6 +497,7 @@ function buildRankingRows() {
     return filtered.map(r => ({
       cnpj_digits: r.cnpj_digits, name: r.name, tickers: r.tickers,
       monthLabel: monthLabel(r.month), val: r.val, qty: Math.abs(r.qty), price: r.price,
+      pct: hasPct ? r.pct : null,
     }));
   }
 
@@ -470,17 +505,23 @@ function buildRankingRows() {
   for (const r of filtered) {
     let g = byCompany.get(r.cnpj_digits);
     if (!g) {
-      g = { cnpj_digits: r.cnpj_digits, name: r.name, tickers: r.tickers, val: 0, qty: 0, months: new Set() };
+      g = { cnpj_digits: r.cnpj_digits, name: r.name, tickers: r.tickers, val: 0, qty: 0, grossQty: 0, grossVal: 0, months: new Set(), shares: null };
       byCompany.set(r.cnpj_digits, g);
     }
     g.val += r.val;
     g.qty += r.qty;
+    g.grossQty += r.gross_qty;
+    g.grossVal += r.gross_val;
     g.months.add(r.month);
+    // Total shares is constant per company -- back it out from any one row's
+    // pct so the grouped total can be re-expressed as a percentage too.
+    if (g.shares === null && r.pct) g.shares = Math.abs(r.qty) / (r.pct / 100);
   }
   return [...byCompany.values()].map(g => ({
     cnpj_digits: g.cnpj_digits, name: g.name, tickers: g.tickers,
     monthLabel: g.months.size === 1 ? monthLabel([...g.months][0]) : `${g.months.size} meses`,
-    val: g.val, qty: Math.abs(g.qty), price: g.qty ? Math.abs(g.val / g.qty) : 0,
+    val: g.val, qty: Math.abs(g.qty), price: g.grossQty ? g.grossVal / g.grossQty : 0,
+    pct: hasPct && g.shares ? (Math.abs(g.qty) / g.shares) * 100 : null,
   }));
 }
 
@@ -492,7 +533,7 @@ function renderRanking() {
     let av, bv;
     if (sortKey === "tickers") { av = a.tickers[0] || ""; bv = b.tickers[0] || ""; }
     else if (sortKey === "month") { av = a.monthLabel; bv = b.monthLabel; }
-    else if (sortKey === "pct") { av = 0; bv = 0; }
+    else if (sortKey === "pct") { av = a.pct ?? -1; bv = b.pct ?? -1; }
     else { av = a[sortKey]; bv = b[sortKey]; }
     if (av < bv) return sortDir === "asc" ? -1 : 1;
     if (av > bv) return sortDir === "asc" ? 1 : -1;
@@ -517,7 +558,7 @@ function renderRanking() {
       <td class="${r.val >= 0 ? "val-positive" : "val-negative"}">${fmtBRL(r.val)}</td>
       <td>${fmtQty(r.qty)}</td>
       <td>${fmtPrice(r.price)}</td>
-      <td>–</td>
+      <td>${r.pct != null ? r.pct.toFixed(2) + "%" : "–"}</td>
     </tr>`).join("");
 
   rankingTbody.querySelectorAll("tr").forEach(tr => {

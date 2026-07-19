@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
-"""Downloads CVM open data (VLMO + FCA) and builds static JSON for the dashboard.
+"""Downloads CVM open data (VLMO + FCA + IPE) and builds static JSON for the dashboard.
 
 Sources (CVM Open Data Portal, updated weekly by CVM):
   https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/VLMO/DADOS/vlmo_cia_aberta_con_{year}.zip
   https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/FCA/DADOS/fca_cia_aberta_{year}.zip
+  https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/IPE/DADOS/ipe_cia_aberta_{year}.zip
 
-No third-party dependencies -- stdlib only, so this runs in CI with no pip install.
+Company buybacks ("Negociação de Valores Mobiliários pela própria companhia,
+suas controladas e coligadas") are filed under the same Art. 11 rule as
+insider disclosures, but CVM's own structured VLMO dataset only extracts
+the insider half (Tipo="Posição Consolidada") into CSV -- the buyback half
+(Tipo="Posição Individual - Cia, Controladas e Coligadas") only exists as a
+PDF, linked from the general IPE filing index. See parse_buyback_pdf.py.
+
+Needs pdfplumber (see requirements.txt) -- everything else is stdlib.
 """
+import concurrent.futures
 import csv
 import datetime
 import io
 import json
 import pathlib
 import re
+import time
 import urllib.request
 import zipfile
+
+from parse_buyback_pdf import parse_buyback_pdf
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT_DIR = ROOT / "data"
@@ -25,6 +37,10 @@ YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1]
 
 VLMO_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/VLMO/DADOS/vlmo_cia_aberta_{year}.zip"
 FCA_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/FCA/DADOS/fca_cia_aberta_{year}.zip"
+IPE_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/IPE/DADOS/ipe_cia_aberta_{year}.zip"
+FRE_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/FRE/DADOS/fre_cia_aberta_{year}.zip"
+FRE_YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1, CURRENT_YEAR - 2]
+BUYBACK_TIPO = "Posição Individual - Cia, Controladas e Coligadas"
 
 TRADE_MOVEMENTS = {
     "Compra", "Compra à vista", "Compra à termo",
@@ -60,6 +76,148 @@ def read_csv_member(zf: zipfile.ZipFile, name: str):
         yield from csv.DictReader(text, delimiter=";")
 
 
+def fetch_url(url: str, retries: int = 3) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_err
+
+
+def accumulate_monthly(bucket_dict: dict, month: str, qty: float, vol: float, is_buy: bool):
+    """Gross (unsigned) sums are kept alongside the signed net so Preço Médio
+    can be computed as total value / total quantity -- see the comment in
+    build_monthly_rows for why the naive net/net ratio can blow up."""
+    sign = 1.0 if is_buy else -1.0
+    bucket = bucket_dict.setdefault(month, {"qty": 0.0, "val": 0.0, "gross_qty": 0.0, "gross_val": 0.0})
+    bucket["qty"] += sign * qty
+    bucket["val"] += sign * vol
+    bucket["gross_qty"] += qty
+    bucket["gross_val"] += vol
+
+
+def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict, dict]:
+    """cnpj -> [(month, pdf_url), ...] for the buyback-specific filing, plus
+    cnpj -> company name (needed for companies that have buyback filings but
+    no insider ones, so main() has a name to write even for those).
+
+    Restricted to known_cnpjs (companies we already track via VLMO/FCA) to
+    avoid spending requests on the long tail of unlisted/inactive filers.
+    """
+    filings: dict[str, list[tuple[str, str]]] = {}
+    names: dict[str, str] = {}
+    for year in years:
+        url = IPE_URL.format(year=year)
+        print(f"Downloading {url}")
+        try:
+            zf = fetch_zip(url)
+        except Exception as e:
+            print(f"  skip {year}: {e}")
+            continue
+        member = f"ipe_cia_aberta_{year}.csv"
+        if member not in zf.namelist():
+            continue
+        for row in read_csv_member(zf, member):
+            if row.get("Tipo", "").strip() != BUYBACK_TIPO:
+                continue
+            cnpj = row["CNPJ_Companhia"].strip()
+            if cnpj not in known_cnpjs:
+                continue
+            names[cnpj] = row["Nome_Companhia"].strip()
+            month = row["Data_Referencia"].strip()[:7]
+            link = row.get("Link_Download", "").strip()
+            if link:
+                filings.setdefault(cnpj, []).append((month, link))
+    return filings, names
+
+
+def fetch_and_parse_buyback(args) -> tuple[str, str, list[dict]]:
+    cnpj, month, url = args
+    try:
+        pdf_bytes = fetch_url(url)
+        records = parse_buyback_pdf(pdf_bytes, month)
+        return cnpj, month, records
+    except Exception as e:
+        print(f"  buyback fetch failed for {cnpj} {month}: {e}")
+        return cnpj, month, []
+
+
+def load_buybacks(years: list[int], known_cnpjs: set[str]) -> dict[str, dict]:
+    """cnpj -> {"name": ..., "records": [...], "monthly": {...}}, parsed from PDFs."""
+    filings, names = load_buyback_filings(years, known_cnpjs)
+    tasks = [(cnpj, month, url) for cnpj, entries in filings.items() for month, url in entries]
+    print(f"Fetching {len(tasks)} buyback filings...")
+
+    result: dict[str, dict] = {}
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        for cnpj, month, records in pool.map(fetch_and_parse_buyback, tasks):
+            done += 1
+            if done % 250 == 0:
+                print(f"  ...{done}/{len(tasks)}")
+            company = result.setdefault(cnpj, {"name": names.get(cnpj, ""), "records": [], "monthly": {}})
+            if not records:
+                continue
+            company["records"].extend(records)
+            for r in records:
+                if r["asset"] in SHARE_ASSETS:
+                    accumulate_monthly(company["monthly"], month, r["qty"], r["volume"], r["movement"].startswith("Compra"))
+    print(f"Parsed buyback activity for {len(result)} companies")
+    return result
+
+
+def load_total_shares() -> dict[str, float]:
+    """cnpj -> best-known total share count, from FRE capital tables.
+
+    Used for % do Capital on buybacks (insiders don't get this figure --
+    see the app.js note on why it's not meaningful there). Coverage is
+    incomplete (not every company refiles every year, and a few, like
+    Petrobras, are absent from every year checked) -- callers must treat a
+    missing cnpj as unknown, not zero, and show "--" rather than 0%.
+    """
+    issued: dict[str, tuple[str, float]] = {}      # cnpj -> (data_referencia, shares), from capital_social
+    circulating: dict[str, tuple[str, float]] = {}  # cnpj -> (data_referencia, shares), from distribuicao_capital
+
+    def consider(store: dict, cnpj: str, ref: str, shares_str: str):
+        shares = _num(shares_str)
+        if not shares or shares <= 0:
+            return
+        prev = store.get(cnpj)
+        if prev is None or ref > prev[0]:
+            store[cnpj] = (ref, shares)
+
+    for year in FRE_YEARS:
+        url = FRE_URL.format(year=year)
+        print(f"Downloading {url}")
+        try:
+            zf = fetch_zip(url)
+        except Exception as e:
+            print(f"  skip {year}: {e}")
+            continue
+        member = f"fre_cia_aberta_capital_social_{year}.csv"
+        if member in zf.namelist():
+            for row in read_csv_member(zf, member):
+                if row.get("Tipo_Capital", "").strip() != "Capital Emitido":
+                    continue
+                consider(issued, row["CNPJ_Companhia"].strip(), row["Data_Referencia"].strip(), row.get("Quantidade_Total_Acoes", ""))
+        member = f"fre_cia_aberta_distribuicao_capital_{year}.csv"
+        if member in zf.namelist():
+            for row in read_csv_member(zf, member):
+                consider(circulating, row["CNPJ_Companhia"].strip(), row["Data_Referencia"].strip(), row.get("Quantidade_Total_Acoes_Circulacao", ""))
+
+    # Prefer total shares issued (capital_social); fall back to shares in
+    # circulation for companies that only reported the latter.
+    result = {cnpj: shares for cnpj, (ref, shares) in circulating.items()}
+    result.update({cnpj: shares for cnpj, (ref, shares) in issued.items()})
+    return result
+
+
 def load_tickers() -> dict[str, list[str]]:
     """cnpj -> sorted list of currently-listed B3 tickers, from FCA valor_mobiliario table."""
     tickers: dict[str, set[str]] = {}
@@ -88,7 +246,14 @@ def load_tickers() -> dict[str, list[str]]:
 
 
 def load_transactions() -> dict[str, dict]:
-    """cnpj -> {name, buybacks: [...], insiders: [...], monthly: {...}}"""
+    """cnpj -> {name, insiders: [...], monthly: {...}}
+
+    Note: this dataset's "Tipo_Cargo blank" rows (nominally the company's own
+    trades) are almost never populated with real trades -- CVM's structured
+    extraction of that sub-section is unreliable (verified: 5 real trade rows
+    across all ~500 companies for a full year). Real buyback data comes from
+    load_buybacks() instead, which parses the actual filed PDFs.
+    """
     companies: dict[str, dict] = {}
     for year in YEARS:
         url = VLMO_URL.format(year=year)
@@ -102,10 +267,12 @@ def load_transactions() -> dict[str, dict]:
         if member not in zf.namelist():
             continue
         for row in read_csv_member(zf, member):
+            cargo = row["Tipo_Cargo"].strip()
+            if not cargo:
+                continue  # not an insider row -- see load_buybacks() instead
             cnpj = row["CNPJ_Companhia"].strip()
             company = companies.setdefault(
-                cnpj,
-                {"name": row["Nome_Companhia"].strip(), "buybacks": [], "insiders": [], "monthly": {}},
+                cnpj, {"name": row["Nome_Companhia"].strip(), "insiders": [], "monthly": {}}
             )
             movimentacao = row["Tipo_Movimentacao"].strip()
             is_trade = movimentacao in TRADE_MOVEMENTS
@@ -122,22 +289,13 @@ def load_transactions() -> dict[str, dict]:
                 "qty": _num(row["Quantidade"]),
                 "price": _num(row["Preco_Unitario"]),
                 "volume": _num(row["Volume"]),
+                "role": cargo,
             }
-            cargo = row["Tipo_Cargo"].strip()
-            if cargo:
-                record["role"] = cargo
-                company["insiders"].append(record)
-            else:
-                company["buybacks"].append(record)
+            company["insiders"].append(record)
 
-            if cargo and is_trade and asset in SHARE_ASSETS:
+            if is_trade and asset in SHARE_ASSETS:
                 month = record["ref"][:7]
-                qty = record["qty"] or 0.0
-                vol = record["volume"] or 0.0
-                sign = 1.0 if movimentacao.startswith("Compra") else -1.0
-                bucket = company["monthly"].setdefault(month, {"qty": 0.0, "val": 0.0})
-                bucket["qty"] += sign * qty
-                bucket["val"] += sign * vol
+                accumulate_monthly(company["monthly"], month, record["qty"] or 0.0, record["volume"] or 0.0, movimentacao.startswith("Compra"))
     return companies
 
 
@@ -151,50 +309,76 @@ def _num(value: str):
         return None
 
 
+def monthly_dict_to_rows(monthly: dict, cnpj_digits: str, name: str, company_tickers: list[str], months_seen: set, total_shares=None):
+    rows = []
+    for month, agg in monthly.items():
+        months_seen.add(month)
+        qty, val = agg["qty"], agg["val"]
+        gross_qty, gross_val = agg["gross_qty"], agg["gross_val"]
+        if not qty:
+            continue
+        row = {
+            "cnpj_digits": cnpj_digits,
+            "name": name,
+            "tickers": company_tickers,
+            "month": month,
+            "qty": qty,
+            "val": val,
+            "gross_qty": gross_qty,
+            "gross_val": gross_val,
+            "price": gross_val / gross_qty if gross_qty else 0,
+        }
+        if total_shares is not None:
+            shares = total_shares.get(cnpj_digits)
+            row["pct"] = abs(qty) / shares * 100 if shares else None
+        rows.append(row)
+    return rows
+
+
 def main():
     tickers = load_tickers()
     companies = load_transactions()
+    buybacks = load_buybacks(YEARS, known_cnpjs=set(tickers.keys()))
+    total_shares_by_cnpj = load_total_shares()
+    total_shares = {
+        "".join(ch for ch in cnpj if ch.isdigit()): shares
+        for cnpj, shares in total_shares_by_cnpj.items()
+    }
 
     BY_COMPANY_DIR.mkdir(parents=True, exist_ok=True)
     index = []
     monthly_rows = []
+    bb_monthly_rows = []
     months_seen = set()
-    for cnpj, data in companies.items():
+
+    all_cnpjs = set(companies.keys()) | set(buybacks.keys())
+    for cnpj in all_cnpjs:
+        bb = buybacks.get(cnpj, {"records": [], "monthly": {}})
+        data = companies.get(cnpj) or {"name": bb.get("name", ""), "insiders": [], "monthly": {}}
         company_tickers = tickers.get(cnpj, [])
         cnpj_digits = "".join(ch for ch in cnpj if ch.isdigit())
+        name = data["name"]
         index.append({
             "cnpj": cnpj,
             "cnpj_digits": cnpj_digits,
-            "name": data["name"],
+            "name": name,
             "tickers": company_tickers,
-            "buyback_count": len(data["buybacks"]),
+            "buyback_count": len(bb["records"]),
             "insider_count": len(data["insiders"]),
         })
         with open(BY_COMPANY_DIR / f"{cnpj_digits}.json", "w", encoding="utf-8") as f:
             json.dump({
                 "cnpj": cnpj,
-                "name": data["name"],
+                "name": name,
                 "tickers": company_tickers,
-                "buybacks": data["buybacks"],
+                "buybacks": bb["records"],
                 "insiders": data["insiders"],
             }, f, ensure_ascii=False, separators=(",", ":"))
 
         if not company_tickers:
             continue  # not usable in ranking tables without a ticker to display
-        for month, agg in data["monthly"].items():
-            months_seen.add(month)
-            qty, val = agg["qty"], agg["val"]
-            if not qty:
-                continue
-            monthly_rows.append({
-                "cnpj_digits": cnpj_digits,
-                "name": data["name"],
-                "tickers": company_tickers,
-                "month": month,
-                "qty": qty,
-                "val": val,
-                "price": abs(val / qty),
-            })
+        monthly_rows.extend(monthly_dict_to_rows(data["monthly"], cnpj_digits, name, company_tickers, months_seen))
+        bb_monthly_rows.extend(monthly_dict_to_rows(bb["monthly"], cnpj_digits, name, company_tickers, months_seen, total_shares=total_shares))
 
     index.sort(key=lambda c: c["name"])
     with open(OUT_DIR / "companies.json", "w", encoding="utf-8") as f:
@@ -203,6 +387,10 @@ def main():
     monthly_rows.sort(key=lambda r: r["month"])
     with open(OUT_DIR / "monthly.json", "w", encoding="utf-8") as f:
         json.dump(monthly_rows, f, ensure_ascii=False, separators=(",", ":"))
+
+    bb_monthly_rows.sort(key=lambda r: r["month"])
+    with open(OUT_DIR / "bb_monthly.json", "w", encoding="utf-8") as f:
+        json.dump(bb_monthly_rows, f, ensure_ascii=False, separators=(",", ":"))
 
     today = datetime.date.today()
     last_complete_month = (today.replace(day=1) - datetime.timedelta(days=1)).strftime("%Y-%m")
@@ -216,7 +404,8 @@ def main():
             "available_months": sorted(months_seen),
         }, f)
 
-    print(f"Wrote {len(index)} companies and {len(monthly_rows)} monthly rows to {OUT_DIR}")
+    print(f"Wrote {len(index)} companies, {len(monthly_rows)} insider monthly rows, "
+          f"{len(bb_monthly_rows)} buyback monthly rows to {OUT_DIR}")
 
 
 if __name__ == "__main__":
