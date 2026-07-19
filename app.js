@@ -8,12 +8,14 @@ fetch("data/companies.json")
   .then(r => r.json())
   .then(data => { companies = data; });
 
-fetch("data/meta.json")
-  .then(r => r.json())
-  .then(meta => {
-    document.getElementById("meta-note").textContent =
-      `Dados CVM (${meta.years.join(", ")}) · ${meta.company_count} companhias · atualizado em ${meta.generated_at.slice(0, 10)}`;
-  });
+Promise.all([
+  fetch("data/meta.json").then(r => r.json()),
+  fetch("data/monthly.json").then(r => r.json()),
+]).then(([meta, monthly]) => {
+  document.getElementById("meta-note").textContent =
+    `Dados CVM (${meta.years.join(", ")}) · ${meta.company_count} companhias · atualizado em ${meta.generated_at.slice(0, 10)}`;
+  initRanking(meta, monthly);
+});
 
 function norm(s) {
   return (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
@@ -285,4 +287,246 @@ function renderRoleBreakdown(roleTotals) {
     container.appendChild(row);
   });
   if (!any) container.innerHTML = `<div class="empty-note">Sem dados de administradores no período.</div>`;
+}
+
+/* --- Ranking: top insider purchases, filterable like carteirafundos.com --- */
+
+let rankingMeta = null;
+let rankingMonthly = [];
+let selectedMonths = new Set();
+let rankingTickerFilter = "";
+let groupByTicker = false;
+let sortKey = "val";
+let sortDir = "desc";
+let pickerYear = null;
+
+const monthBtn = document.getElementById("month-picker-btn");
+const monthPanel = document.getElementById("month-picker-panel");
+const tickerFilterInput = document.getElementById("ticker-filter");
+const groupToggle = document.getElementById("group-toggle");
+const rankingTbody = document.getElementById("ranking-tbody");
+const rankingTable = document.getElementById("ranking-table");
+const rankingEmpty = document.getElementById("ranking-empty");
+
+function initRanking(meta, monthly) {
+  rankingMeta = meta;
+  rankingMonthly = monthly;
+  selectedMonths = new Set([meta.last_complete_month]);
+  pickerYear = Number(meta.last_complete_month.slice(0, 4));
+
+  tickerFilterInput.addEventListener("input", () => {
+    rankingTickerFilter = norm(tickerFilterInput.value.trim());
+    renderRanking();
+  });
+  groupToggle.addEventListener("change", () => {
+    groupByTicker = groupToggle.checked;
+    renderRanking();
+  });
+  monthBtn.addEventListener("click", () => {
+    monthPanel.hidden = !monthPanel.hidden;
+    if (!monthPanel.hidden) renderMonthPanel();
+  });
+  document.addEventListener("click", e => {
+    if (!e.target.closest(".month-picker-wrap")) monthPanel.hidden = true;
+  });
+  rankingTable.querySelectorAll("th[data-sort]").forEach(th => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.sort;
+      if (sortKey === key) sortDir = sortDir === "desc" ? "asc" : "desc";
+      else { sortKey = key; sortDir = key === "tickers" || key === "month" ? "asc" : "desc"; }
+      renderRanking();
+    });
+  });
+
+  updateMonthBtnLabel();
+  renderRanking();
+}
+
+function updateMonthBtnLabel() {
+  const n = selectedMonths.size;
+  monthBtn.textContent = n === 1 ? "1 mês selecionado" : `${n} meses selecionados`;
+}
+
+function renderMonthPanel() {
+  const years = [...new Set(rankingMeta.available_months.map(m => m.slice(0, 4)))].sort();
+  monthPanel.innerHTML = "";
+
+  const shortcuts = document.createElement("div");
+  shortcuts.className = "month-picker-shortcuts";
+  const lastMonthBtn = document.createElement("button");
+  lastMonthBtn.textContent = "Último mês";
+  lastMonthBtn.addEventListener("click", () => {
+    selectedMonths = new Set([rankingMeta.last_complete_month]);
+    updateMonthBtnLabel(); renderMonthPanel(); renderRanking();
+  });
+  const ytdBtn = document.createElement("button");
+  ytdBtn.textContent = "YTD";
+  ytdBtn.addEventListener("click", () => {
+    const year = rankingMeta.last_complete_month.slice(0, 4);
+    selectedMonths = new Set(rankingMeta.available_months.filter(m => m.startsWith(year)));
+    updateMonthBtnLabel(); renderMonthPanel(); renderRanking();
+  });
+  shortcuts.append(lastMonthBtn, ytdBtn);
+  monthPanel.appendChild(shortcuts);
+
+  const yearRow = document.createElement("div");
+  yearRow.className = "year-row";
+  const prevBtn = document.createElement("button");
+  prevBtn.textContent = "‹";
+  prevBtn.disabled = !years.includes(String(pickerYear - 1));
+  prevBtn.addEventListener("click", () => { pickerYear--; renderMonthPanel(); });
+  const yearLabel = document.createElement("span");
+  yearLabel.textContent = pickerYear;
+  const nextBtn = document.createElement("button");
+  nextBtn.textContent = "›";
+  nextBtn.disabled = !years.includes(String(pickerYear + 1));
+  nextBtn.addEventListener("click", () => { pickerYear++; renderMonthPanel(); });
+  yearRow.append(prevBtn, yearLabel, nextBtn);
+  monthPanel.appendChild(yearRow);
+
+  const grid = document.createElement("div");
+  grid.className = "month-grid";
+  const MONTH_ABBR = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+  MONTH_ABBR.forEach((label, i) => {
+    const key = `${pickerYear}-${String(i + 1).padStart(2, "0")}`;
+    const cell = document.createElement("div");
+    const available = rankingMeta.available_months.includes(key);
+    cell.className = "month-cell" + (selectedMonths.has(key) ? " selected" : "") + (available ? "" : " unavailable");
+    cell.textContent = label;
+    if (available) {
+      cell.addEventListener("click", () => {
+        if (selectedMonths.has(key)) selectedMonths.delete(key);
+        else selectedMonths.add(key);
+        updateMonthBtnLabel(); renderMonthPanel(); renderRanking();
+      });
+    }
+    grid.appendChild(cell);
+  });
+  monthPanel.appendChild(grid);
+
+  const footer = document.createElement("div");
+  footer.className = "month-picker-footer";
+  const clearBtn = document.createElement("button");
+  clearBtn.textContent = "Limpar seleção";
+  clearBtn.addEventListener("click", () => {
+    selectedMonths.clear();
+    updateMonthBtnLabel(); renderMonthPanel(); renderRanking();
+  });
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "Fechar";
+  closeBtn.addEventListener("click", () => { monthPanel.hidden = true; });
+  footer.append(clearBtn, closeBtn);
+  monthPanel.appendChild(footer);
+}
+
+function monthLabel(ym) {
+  const [y, m] = ym.split("-");
+  return `${m}/${y}`;
+}
+
+function fmtBRL(n) {
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(n);
+  let out;
+  if (abs >= 1e9) out = (abs / 1e9).toFixed(1) + "B";
+  else if (abs >= 1e6) out = (abs / 1e6).toFixed(1) + "M";
+  else if (abs >= 1e3) out = Math.round(abs / 1e3) + "K";
+  else out = Math.round(abs).toLocaleString("pt-BR");
+  return `${sign}R$ ${out.replace(".", ",")}`;
+}
+
+function fmtQty(n) {
+  const abs = Math.abs(n);
+  let out;
+  if (abs >= 1e9) out = (abs / 1e9).toFixed(1) + "B";
+  else if (abs >= 1e6) out = (abs / 1e6).toFixed(1) + "M";
+  else if (abs >= 1e3) out = Math.round(abs / 1e3) + "K";
+  else out = Math.round(abs).toLocaleString("pt-BR");
+  return out.replace(".", ",");
+}
+
+function fmtPrice(n) {
+  return `R$ ${n.toFixed(2).replace(".", ",")}`;
+}
+
+function buildRankingRows() {
+  const filtered = rankingMonthly.filter(r => {
+    if (!selectedMonths.has(r.month)) return false;
+    if (rankingTickerFilter) {
+      const hay = norm(r.name) + " " + r.tickers.map(norm).join(" ");
+      if (!hay.includes(rankingTickerFilter)) return false;
+    }
+    return true;
+  });
+
+  if (!groupByTicker) {
+    return filtered.map(r => ({
+      cnpj_digits: r.cnpj_digits, name: r.name, tickers: r.tickers,
+      monthLabel: monthLabel(r.month), val: r.val, qty: Math.abs(r.qty), price: r.price,
+    }));
+  }
+
+  const byCompany = new Map();
+  for (const r of filtered) {
+    let g = byCompany.get(r.cnpj_digits);
+    if (!g) {
+      g = { cnpj_digits: r.cnpj_digits, name: r.name, tickers: r.tickers, val: 0, qty: 0, months: new Set() };
+      byCompany.set(r.cnpj_digits, g);
+    }
+    g.val += r.val;
+    g.qty += r.qty;
+    g.months.add(r.month);
+  }
+  return [...byCompany.values()].map(g => ({
+    cnpj_digits: g.cnpj_digits, name: g.name, tickers: g.tickers,
+    monthLabel: g.months.size === 1 ? monthLabel([...g.months][0]) : `${g.months.size} meses`,
+    val: g.val, qty: Math.abs(g.qty), price: g.qty ? Math.abs(g.val / g.qty) : 0,
+  }));
+}
+
+function renderRanking() {
+  if (!rankingMeta) return;
+  let rows = buildRankingRows();
+
+  rows.sort((a, b) => {
+    let av, bv;
+    if (sortKey === "tickers") { av = a.tickers[0] || ""; bv = b.tickers[0] || ""; }
+    else if (sortKey === "month") { av = a.monthLabel; bv = b.monthLabel; }
+    else if (sortKey === "pct") { av = 0; bv = 0; }
+    else { av = a[sortKey]; bv = b[sortKey]; }
+    if (av < bv) return sortDir === "asc" ? -1 : 1;
+    if (av > bv) return sortDir === "asc" ? 1 : -1;
+    return 0;
+  });
+
+  rankingTable.querySelectorAll("th[data-sort]").forEach(th => {
+    th.classList.toggle("sorted", th.dataset.sort === sortKey);
+  });
+
+  if (rows.length === 0) {
+    rankingTbody.innerHTML = "";
+    rankingEmpty.hidden = false;
+    return;
+  }
+  rankingEmpty.hidden = true;
+
+  rankingTbody.innerHTML = rows.map(r => `
+    <tr data-cnpj="${r.cnpj_digits}">
+      <td class="ticker-cell">${r.tickers.join(" · ")}</td>
+      <td>${r.monthLabel}</td>
+      <td class="${r.val >= 0 ? "val-positive" : "val-negative"}">${fmtBRL(r.val)}</td>
+      <td>${fmtQty(r.qty)}</td>
+      <td>${fmtPrice(r.price)}</td>
+      <td>–</td>
+    </tr>`).join("");
+
+  rankingTbody.querySelectorAll("tr").forEach(tr => {
+    tr.addEventListener("click", () => {
+      const c = companies.find(c => c.cnpj_digits === tr.dataset.cnpj);
+      if (c) {
+        selectCompany(c);
+        panel.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    });
+  });
 }

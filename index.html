@@ -18,6 +18,40 @@
     <div id="results" class="search-results" hidden></div>
   </div>
 
+  <section class="ranking-section">
+    <h2>Top compras de insiders</h2>
+    <p class="subtitle-small">Negociação de administradores e pessoas ligadas &mdash; dados abertos CVM</p>
+
+    <div class="filter-bar">
+      <div class="month-picker-wrap">
+        <button id="month-picker-btn" class="filter-btn" type="button"></button>
+        <div id="month-picker-panel" class="month-picker-panel" hidden></div>
+      </div>
+      <input id="ticker-filter" type="text" class="filter-btn ticker-filter-input" placeholder="Filtrar por ticker…" autocomplete="off">
+      <label class="group-toggle">
+        <input id="group-toggle" type="checkbox">
+        Agrupar por ticker
+      </label>
+    </div>
+
+    <div class="ranking-table-wrap">
+      <table class="ranking-table" id="ranking-table">
+        <thead>
+          <tr>
+            <th data-sort="tickers">Ticker</th>
+            <th data-sort="month">Mês</th>
+            <th data-sort="val">Valor</th>
+            <th data-sort="qty">Qtd Ações</th>
+            <th data-sort="price">Preço Médio</th>
+            <th data-sort="pct">% do Capital</th>
+          </tr>
+        </thead>
+        <tbody id="ranking-tbody"></tbody>
+      </table>
+      <div id="ranking-empty" class="empty-note" hidden>Nenhum resultado para os filtros selecionados.</div>
+    </div>
+  </section>
+
   <main id="panel" class="company-panel" hidden>
     <div class="company-title">
       <h2 id="company-name"></h2>
