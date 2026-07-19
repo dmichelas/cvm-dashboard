@@ -79,17 +79,46 @@ function direction(movement) {
 
 const SHARE_ASSETS = new Set(["Ações", "Units", "BDR Patrocinados"]);
 
-function monthlyAggregate(records) {
+function median(nums) {
+  const s = [...nums].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+// allMonths: the full known month range (rankingMeta.available_months) so
+// the chart shows every past month, not just ones with activity, and a
+// company with a data gap doesn't read as having a shorter history.
+function monthlyAggregate(records, allMonths) {
   const byMonth = new Map();
+  for (const month of allMonths) byMonth.set(month, { month, buy: 0, sell: 0, grossQty: 0, grossVal: 0, price: null });
+
+  const rowsByMonth = new Map();
   for (const r of records) {
     if (!r.is_trade || !SHARE_ASSETS.has(r.asset)) continue;
     const dir = direction(r.movement);
-    if (!dir) continue;
     const month = (r.ref || "").slice(0, 7);
-    if (!month) continue;
-    if (!byMonth.has(month)) byMonth.set(month, { month, buy: 0, sell: 0 });
-    byMonth.get(month)[dir] += r.qty || 0;
+    if (!dir || !byMonth.has(month)) continue;
+    if (!rowsByMonth.has(month)) rowsByMonth.set(month, []);
+    rowsByMonth.get(month).push({ ...r, dir });
   }
+
+  // Same fat-finger-typo guard as the server-side pipeline (see ingest.py's
+  // compute_monthly): drop rows priced >5x off the month's median before
+  // aggregating, since CVM's source filings occasionally have one.
+  for (const [month, rows] of rowsByMonth) {
+    const priced = rows.filter(r => r.price).map(r => r.price);
+    const med = priced.length ? median(priced) : null;
+    const good = rows.filter(r => !r.price || med === null || (r.price / med >= 0.2 && r.price / med <= 5));
+    const m = byMonth.get(month);
+    for (const r of good) {
+      const q = r.qty || 0, v = r.volume || 0;
+      m[r.dir] += q;
+      m.grossQty += q;
+      m.grossVal += v;
+    }
+  }
+
+  for (const m of byMonth.values()) m.price = m.grossQty ? m.grossVal / m.grossQty : null;
   return [...byMonth.values()].sort((a, b) => a.month.localeCompare(b.month));
 }
 
@@ -119,8 +148,9 @@ function renderCompany(data) {
   const tickerRow = document.getElementById("company-tickers");
   tickerRow.innerHTML = data.tickers.map(t => `<span class="ticker-chip">${t}</span>`).join("");
 
-  const buybackMonthly = monthlyAggregate(data.buybacks);
-  const insiderMonthly = monthlyAggregate(data.insiders);
+  const allMonths = rankingMeta.available_months;
+  const buybackMonthly = monthlyAggregate(data.buybacks, allMonths);
+  const insiderMonthly = monthlyAggregate(data.insiders, allMonths);
   const roleTotals = roleAggregate(data.insiders);
 
   renderStats(buybackMonthly, insiderMonthly);
@@ -131,11 +161,12 @@ function renderCompany(data) {
 
 function renderStats(buybackMonthly, insiderMonthly) {
   const sum = (arr, key) => arr.reduce((s, m) => s + m[key], 0);
+  const n = buybackMonthly.length;
   const stats = [
-    { label: "Ações recompradas (24m)", value: fmtCompact(sum(buybackMonthly, "buy")), cls: "buy" },
-    { label: "Ações vendidas pela cia (24m)", value: fmtCompact(sum(buybackMonthly, "sell")), cls: "sell" },
-    { label: "Compras de insiders (24m)", value: fmtCompact(sum(insiderMonthly, "buy")), cls: "buy" },
-    { label: "Vendas de insiders (24m)", value: fmtCompact(sum(insiderMonthly, "sell")), cls: "sell" },
+    { label: `Ações recompradas (${n}m)`, value: fmtCompact(sum(buybackMonthly, "buy")), cls: "buy" },
+    { label: `Ações vendidas pela cia (${n}m)`, value: fmtCompact(sum(buybackMonthly, "sell")), cls: "sell" },
+    { label: `Compras de insiders (${n}m)`, value: fmtCompact(sum(insiderMonthly, "buy")), cls: "buy" },
+    { label: `Vendas de insiders (${n}m)`, value: fmtCompact(sum(insiderMonthly, "sell")), cls: "sell" },
   ];
   document.getElementById("stat-row").innerHTML = stats.map(s =>
     `<div class="stat-tile"><div class="label">${s.label}</div><div class="value ${s.cls}">${s.value}</div></div>`
@@ -155,22 +186,31 @@ function renderDivergingChart(containerId, emptyId, monthly) {
   emptyNote.hidden = true;
 
   const width = container.clientWidth || 680;
-  const height = 220;
-  const padL = 44, padR = 12, padT = 10, padB = 26;
+  const priceRowTop = 46, priceRowBottom = 92; // dot travels in this band; labels extend above it
+  const padL = 44, padR = 12, padT = priceRowBottom + 14, padB = 26;
+  const barH = 150;
+  const height = padT + barH + padB;
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
   const midY = padT + plotH / 2;
 
   const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.buy, m.sell)));
   const scale = (plotH / 2 - 6) / maxVal;
-  const barW = Math.min(24, plotW / monthly.length * 0.6);
+  const barW = Math.min(10, plotW / monthly.length * 0.55);
   const step = plotW / monthly.length;
+
+  const prices = monthly.map(m => m.price).filter(p => p != null);
+  const priceMin = prices.length ? Math.min(...prices) : 0;
+  const priceMax = prices.length ? Math.max(...prices) : 1;
+  const priceRange = priceMax - priceMin || 1;
+  const priceY = p => priceRowBottom - ((p - priceMin) / priceRange) * (priceRowBottom - priceRowTop);
 
   const legend = document.createElement("div");
   legend.className = "legend";
   legend.innerHTML = `
     <span class="legend-item"><span class="legend-swatch" style="background:var(--buy)"></span>Compra</span>
-    <span class="legend-item"><span class="legend-swatch" style="background:var(--sell)"></span>Venda</span>`;
+    <span class="legend-item"><span class="legend-swatch" style="background:var(--sell)"></span>Venda</span>
+    <span class="legend-item"><span class="legend-swatch price-dot-swatch"></span>Preço médio</span>`;
   container.appendChild(legend);
 
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -193,6 +233,7 @@ function renderDivergingChart(containerId, emptyId, monthly) {
   tooltip.className = "bar-tooltip";
   container.style.position = "relative";
 
+  const priceLine = [];
   monthly.forEach((m, i) => {
     const cx = padL + step * i + step / 2;
     if (m.buy > 0) {
@@ -215,7 +256,37 @@ function renderDivergingChart(containerId, emptyId, monthly) {
       label.textContent = m.month;
       svg.appendChild(label);
     }
+    if (m.price != null) {
+      const py = priceY(m.price);
+      priceLine.push(`${cx},${py}`);
+      const dot = document.createElementNS(svg.namespaceURI, "circle");
+      dot.setAttribute("cx", cx);
+      dot.setAttribute("cy", py);
+      dot.setAttribute("r", 2.5);
+      dot.setAttribute("fill", "var(--price-dot)");
+      svg.appendChild(dot);
+
+      const priceLabel = document.createElementNS(svg.namespaceURI, "text");
+      priceLabel.setAttribute("x", cx);
+      priceLabel.setAttribute("y", py - 5);
+      priceLabel.setAttribute("text-anchor", "start");
+      priceLabel.setAttribute("transform", `rotate(-90 ${cx} ${py - 5})`);
+      priceLabel.setAttribute("font-size", "8");
+      priceLabel.setAttribute("fill", "var(--text-secondary)");
+      priceLabel.textContent = fmtPrice(m.price);
+      svg.appendChild(priceLabel);
+    }
   });
+
+  if (priceLine.length > 1) {
+    const poly = document.createElementNS(svg.namespaceURI, "polyline");
+    poly.setAttribute("points", priceLine.join(" "));
+    poly.setAttribute("fill", "none");
+    poly.setAttribute("stroke", "var(--price-dot)");
+    poly.setAttribute("stroke-width", "1");
+    poly.setAttribute("opacity", "0.5");
+    svg.insertBefore(poly, svg.firstChild);
+  }
 
   container.appendChild(svg);
   container.appendChild(tooltip);
@@ -248,7 +319,7 @@ function addHover(svg, cx, cy, m, label, value, tooltip, container) {
   const hit = document.createElementNS(svg.namespaceURI, "circle");
   hit.setAttribute("cx", cx);
   hit.setAttribute("cy", cy);
-  hit.setAttribute("r", 14);
+  hit.setAttribute("r", 6);
   hit.setAttribute("fill", "transparent");
   hit.addEventListener("mouseenter", () => {
     tooltip.textContent = `${m.month} · ${label}: ${fmtCompact(value)} ações`;
@@ -306,7 +377,7 @@ const TAB_INFO = {
   insiders: {
     title: "Top compras de insiders",
     subtitle: "Negociação de administradores e pessoas ligadas — dados abertos CVM",
-    hasPct: false,
+    hasPct: true,
   },
   buybacks: {
     title: "Top recompras",

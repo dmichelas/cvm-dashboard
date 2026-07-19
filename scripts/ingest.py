@@ -22,6 +22,7 @@ import io
 import json
 import pathlib
 import re
+import statistics
 import time
 import urllib.request
 import zipfile
@@ -89,16 +90,46 @@ def fetch_url(url: str, retries: int = 3) -> bytes:
     raise last_err
 
 
-def accumulate_monthly(bucket_dict: dict, month: str, qty: float, vol: float, is_buy: bool):
-    """Gross (unsigned) sums are kept alongside the signed net so Preço Médio
+def compute_monthly(records: list[dict]) -> dict:
+    """Groups a company's trade records by month and aggregates qty/value.
+
+    Rejects per-row price outliers before aggregating: CVM's source filings
+    occasionally have a fat-finger data-entry error (verified case: one
+    entity's rows for a single month priced some trades at R$1,242/share
+    against a R$12-14 range the same week -- the Volume field was
+    internally consistent with that bad price, confirming it's a source
+    error, not a parsing bug). A row priced more than 5x off the month's
+    median is dropped from the aggregate; a stock's price realistically
+    never moves that much within one month, so this only ever catches
+    genuine data-entry errors.
+
+    Gross (unsigned) sums are kept alongside the signed net so Preço Médio
     can be computed as total value / total quantity -- see the comment in
-    build_monthly_rows for why the naive net/net ratio can blow up."""
-    sign = 1.0 if is_buy else -1.0
-    bucket = bucket_dict.setdefault(month, {"qty": 0.0, "val": 0.0, "gross_qty": 0.0, "gross_val": 0.0})
-    bucket["qty"] += sign * qty
-    bucket["val"] += sign * vol
-    bucket["gross_qty"] += qty
-    bucket["gross_val"] += vol
+    monthly_dict_to_rows for why the naive net/net ratio can blow up.
+    """
+    by_month: dict[str, list[dict]] = {}
+    for r in records:
+        if not r.get("is_trade") or r.get("asset") not in SHARE_ASSETS:
+            continue
+        by_month.setdefault(r["ref"][:7], []).append(r)
+
+    result = {}
+    for month, recs in by_month.items():
+        priced = [r["price"] for r in recs if r.get("price")]
+        med = statistics.median(priced) if priced else None
+        good = [r for r in recs if not r.get("price") or med is None or 0.2 <= r["price"] / med <= 5]
+
+        qty = val = gross_qty = gross_val = 0.0
+        for r in good:
+            q, v = r.get("qty") or 0.0, r.get("volume") or 0.0
+            sign = 1.0 if r["movement"].startswith("Compra") else -1.0
+            qty += sign * q
+            val += sign * v
+            gross_qty += q
+            gross_val += v
+        if qty:
+            result[month] = {"qty": qty, "val": val, "gross_qty": gross_qty, "gross_val": gross_val}
+    return result
 
 
 def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict, dict]:
@@ -160,13 +191,11 @@ def load_buybacks(years: list[int], known_cnpjs: set[str]) -> dict[str, dict]:
             done += 1
             if done % 250 == 0:
                 print(f"  ...{done}/{len(tasks)}")
-            company = result.setdefault(cnpj, {"name": names.get(cnpj, ""), "records": [], "monthly": {}})
-            if not records:
-                continue
+            company = result.setdefault(cnpj, {"name": names.get(cnpj, ""), "records": []})
             company["records"].extend(records)
-            for r in records:
-                if r["asset"] in SHARE_ASSETS:
-                    accumulate_monthly(company["monthly"], month, r["qty"], r["volume"], r["movement"].startswith("Compra"))
+
+    for company in result.values():
+        company["monthly"] = compute_monthly(company["records"])
     print(f"Parsed buyback activity for {len(result)} companies")
     return result
 
@@ -292,9 +321,8 @@ def load_transactions() -> dict[str, dict]:
             }
             company["insiders"].append(record)
 
-            if is_trade and asset in SHARE_ASSETS:
-                month = record["ref"][:7]
-                accumulate_monthly(company["monthly"], month, record["qty"] or 0.0, record["volume"] or 0.0, movimentacao.startswith("Compra"))
+    for company in companies.values():
+        company["monthly"] = compute_monthly(company["insiders"])
     return companies
 
 
@@ -376,7 +404,7 @@ def main():
 
         if not company_tickers:
             continue  # not usable in ranking tables without a ticker to display
-        monthly_rows.extend(monthly_dict_to_rows(data["monthly"], cnpj_digits, name, company_tickers, months_seen))
+        monthly_rows.extend(monthly_dict_to_rows(data["monthly"], cnpj_digits, name, company_tickers, months_seen, total_shares=total_shares))
         bb_monthly_rows.extend(monthly_dict_to_rows(bb["monthly"], cnpj_digits, name, company_tickers, months_seen, total_shares=total_shares))
 
     index.sort(key=lambda c: c["name"])
