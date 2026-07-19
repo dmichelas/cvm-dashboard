@@ -327,12 +327,19 @@ const rankingSubtitle = document.getElementById("ranking-subtitle");
 const tabInsidersBtn = document.getElementById("tab-insiders");
 const tabBuybacksBtn = document.getElementById("tab-buybacks");
 
+function latestMonthWithData(tab) {
+  const months = rankingDatasets[tab].map(r => r.month);
+  if (months.length === 0) return rankingMeta.last_complete_month;
+  return months.reduce((a, b) => (a > b ? a : b));
+}
+
 function initRanking(meta, monthly, bbMonthly) {
   rankingMeta = meta;
   rankingDatasets.insiders = monthly;
   rankingDatasets.buybacks = bbMonthly;
-  selectedMonths = new Set([meta.last_complete_month]);
-  pickerYear = Number(meta.last_complete_month.slice(0, 4));
+  const initial = latestMonthWithData(activeTab);
+  selectedMonths = new Set([initial]);
+  pickerYear = Number(initial.slice(0, 4));
 
   tickerFilterInput.addEventListener("input", () => {
     rankingTickerFilter = norm(tickerFilterInput.value.trim());
@@ -371,6 +378,13 @@ function switchTab(tab) {
   tabBuybacksBtn.classList.toggle("active", tab === "buybacks");
   rankingTitle.textContent = TAB_INFO[tab].title;
   rankingSubtitle.textContent = TAB_INFO[tab].subtitle;
+  // Each dataset can have different real coverage (e.g. CVM briefly serving
+  // a 404 on one source file left buybacks lagging insiders by several
+  // months) -- default to this tab's own latest month, not a shared one.
+  const latest = latestMonthWithData(tab);
+  selectedMonths = new Set([latest]);
+  pickerYear = Number(latest.slice(0, 4));
+  updateMonthBtnLabel();
   renderRanking();
 }
 
@@ -388,14 +402,18 @@ function renderMonthPanel() {
   const lastMonthBtn = document.createElement("button");
   lastMonthBtn.textContent = "Último mês";
   lastMonthBtn.addEventListener("click", () => {
-    selectedMonths = new Set([rankingMeta.last_complete_month]);
+    const latest = latestMonthWithData(activeTab);
+    selectedMonths = new Set([latest]);
+    pickerYear = Number(latest.slice(0, 4));
     updateMonthBtnLabel(); renderMonthPanel(); renderRanking();
   });
   const ytdBtn = document.createElement("button");
   ytdBtn.textContent = "YTD";
   ytdBtn.addEventListener("click", () => {
-    const year = rankingMeta.last_complete_month.slice(0, 4);
-    selectedMonths = new Set(rankingMeta.available_months.filter(m => m.startsWith(year)));
+    const latest = latestMonthWithData(activeTab);
+    const year = latest.slice(0, 4);
+    selectedMonths = new Set(rankingMeta.available_months.filter(m => m.startsWith(year) && m <= latest));
+    pickerYear = Number(year);
     updateMonthBtnLabel(); renderMonthPanel(); renderRanking();
   });
   shortcuts.append(lastMonthBtn, ytdBtn);
