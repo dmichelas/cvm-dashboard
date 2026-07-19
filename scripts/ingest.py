@@ -66,8 +66,7 @@ TICKER_OVERRIDES = {
 
 
 def fetch_zip(url: str) -> zipfile.ZipFile:
-    with urllib.request.urlopen(url) as resp:
-        return zipfile.ZipFile(io.BytesIO(resp.read()))
+    return zipfile.ZipFile(io.BytesIO(fetch_url(url)))
 
 
 def read_csv_member(zf: zipfile.ZipFile, name: str):
