@@ -512,9 +512,6 @@ function initRanking(meta, monthly, bbMonthly) {
     monthPanel.hidden = !monthPanel.hidden;
     if (!monthPanel.hidden) renderMonthPanel();
   });
-  document.addEventListener("click", e => {
-    if (!e.target.closest(".month-picker-wrap")) monthPanel.hidden = true;
-  });
   rankingTable.querySelectorAll("th[data-sort]").forEach(th => {
     th.addEventListener("click", () => {
       const key = th.dataset.sort;
