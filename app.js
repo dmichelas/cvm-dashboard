@@ -56,6 +56,8 @@ function selectCompany(c) {
     .then(renderCompany);
 }
 
+const MONTH_ABBR_PT = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+
 const ROLE_ORDER = [
   "Diretor ou Vinculado",
   "Conselho de Administração ou Vinculado",
@@ -237,7 +239,7 @@ function renderDivergingChart(containerId, emptyId, monthly) {
 
   const width = container.clientWidth || 680;
   const priceRowTop = 46, priceRowBottom = 92; // dot travels in this band; labels extend above it
-  const padL = 44, padR = 12, padT = priceRowBottom + 14, padB = 26;
+  const padL = 44, padR = 12, padT = priceRowBottom + 14, padB = 40; // padB fits a tick + month label + year label
   const barH = 150;
   const height = padT + barH + padB;
   const plotW = width - padL - padR;
@@ -284,6 +286,7 @@ function renderDivergingChart(containerId, emptyId, monthly) {
   container.style.position = "relative";
 
   const priceLine = [];
+  let lastYearShown = null;
   monthly.forEach((m, i) => {
     const cx = padL + step * i + step / 2;
     if (m.buy > 0) {
@@ -296,16 +299,44 @@ function renderDivergingChart(containerId, emptyId, monthly) {
       appendBar(svg, cx - barW / 2, midY, barW, h, "var(--sell)", false);
       addHover(svg, cx, midY + h, m, "Venda", m.sell, tooltip, container);
     }
-    if (i % Math.ceil(monthly.length / 8 || 1) === 0) {
-      const label = document.createElementNS(svg.namespaceURI, "text");
-      label.setAttribute("x", cx);
-      label.setAttribute("y", height - 6);
-      label.setAttribute("text-anchor", "middle");
-      label.setAttribute("font-size", "10");
-      label.setAttribute("fill", "var(--text-muted)");
-      label.textContent = m.month;
-      svg.appendChild(label);
+
+    // Every month gets its own tick + abbreviation, directly under its bar,
+    // so the bar-to-label link is unambiguous even at this tight spacing.
+    // The year is only printed once, at the first month of each year, per
+    // the "note the year only once" request -- repeating it under every
+    // month would just be noise given the months already carry it via the
+    // year row below them.
+    const axisY = height - padB;
+    const [yearStr, monStr] = m.month.split("-");
+    const tick = document.createElementNS(svg.namespaceURI, "line");
+    tick.setAttribute("x1", cx); tick.setAttribute("x2", cx);
+    tick.setAttribute("y1", axisY); tick.setAttribute("y2", axisY + 4);
+    tick.setAttribute("stroke", "var(--baseline)");
+    tick.setAttribute("stroke-width", "1");
+    svg.appendChild(tick);
+
+    const monthLabel = document.createElementNS(svg.namespaceURI, "text");
+    monthLabel.setAttribute("x", cx);
+    monthLabel.setAttribute("y", axisY + 13);
+    monthLabel.setAttribute("text-anchor", "middle");
+    monthLabel.setAttribute("font-size", "7.5");
+    monthLabel.setAttribute("fill", "var(--text-muted)");
+    monthLabel.textContent = MONTH_ABBR_PT[parseInt(monStr, 10) - 1];
+    svg.appendChild(monthLabel);
+
+    if (yearStr !== lastYearShown) {
+      lastYearShown = yearStr;
+      const yearLabel = document.createElementNS(svg.namespaceURI, "text");
+      yearLabel.setAttribute("x", cx);
+      yearLabel.setAttribute("y", axisY + 26);
+      yearLabel.setAttribute("text-anchor", "middle");
+      yearLabel.setAttribute("font-size", "10");
+      yearLabel.setAttribute("font-weight", "600");
+      yearLabel.setAttribute("fill", "var(--text-secondary)");
+      yearLabel.textContent = yearStr;
+      svg.appendChild(yearLabel);
     }
+
     if (m.price != null) {
       const py = priceY(m.price);
       priceLine.push(`${cx},${py}`);
