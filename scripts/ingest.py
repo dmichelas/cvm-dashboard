@@ -231,17 +231,34 @@ def load_buybacks(years: list[int], known_cnpjs: set[str]) -> dict[str, dict]:
     return result
 
 
+# Preference order for FRE's capital_social Tipo_Capital when a company
+# reports more than one in the same filing (lower = preferred). Capital
+# Integralizado (paid-in) is the standard "shares actually outstanding now"
+# figure; Emitido and Subscrito are reasonable stand-ins when that's not
+# filed. "Capital Autorizado" is excluded -- it's an authorization ceiling,
+# often far above real shares outstanding, not a current share count.
+CAPITAL_TYPE_RANK = {"Capital Integralizado": 0, "Capital Emitido": 1, "Capital Subscrito": 2}
+
+
 def load_total_shares() -> dict[str, float]:
     """cnpj -> best-known total share count, from FRE capital tables.
 
-    Used for % do Capital on buybacks (insiders don't get this figure --
-    see the app.js note on why it's not meaningful there). Coverage is
-    incomplete (not every company refiles every year, and a few, like
-    Petrobras, are absent from every year checked) -- callers must treat a
-    missing cnpj as unknown, not zero, and show "--" rather than 0%.
+    Used for % do Capital. Coverage is incomplete (not every company
+    refiles every year, and a few are absent every year checked) --
+    callers must treat a missing cnpj as unknown, not zero, and show "--"
+    rather than 0%.
+
+    Falls back to distribuicao_capital's shares-in-circulation figure only
+    when a company has no usable capital_social row at all -- that table is
+    free-float only (excludes controller/insider-held shares by
+    definition), which is the wrong denominator for "% of capital" and,
+    verified in one case (Neogrid), can also just be wrong: its 2026 filing
+    reported 386,399 shares in circulation, a ~10x drop from 2025's
+    3,869,250 with no matching corporate event, while capital_social's
+    Capital Integralizado held steady at 9,140,944 across all three years.
     """
-    issued: dict[str, tuple[str, float]] = {}      # cnpj -> (data_referencia, shares), from capital_social
-    circulating: dict[str, tuple[str, float]] = {}  # cnpj -> (data_referencia, shares), from distribuicao_capital
+    by_type: dict[str, dict[str, tuple[str, float]]] = {}  # tipo -> cnpj -> (ref, shares)
+    circulating: dict[str, tuple[str, float]] = {}  # cnpj -> (ref, shares), from distribuicao_capital
 
     def consider(store: dict, cnpj: str, ref: str, shares_str: str):
         shares = _num(shares_str)
@@ -262,18 +279,22 @@ def load_total_shares() -> dict[str, float]:
         member = f"fre_cia_aberta_capital_social_{year}.csv"
         if member in zf.namelist():
             for row in read_csv_member(zf, member):
-                if row.get("Tipo_Capital", "").strip() != "Capital Emitido":
+                tipo = row.get("Tipo_Capital", "").strip()
+                if tipo not in CAPITAL_TYPE_RANK:
                     continue
-                consider(issued, row["CNPJ_Companhia"].strip(), row["Data_Referencia"].strip(), row.get("Quantidade_Total_Acoes", ""))
+                store = by_type.setdefault(tipo, {})
+                consider(store, row["CNPJ_Companhia"].strip(), row["Data_Referencia"].strip(), row.get("Quantidade_Total_Acoes", ""))
         member = f"fre_cia_aberta_distribuicao_capital_{year}.csv"
         if member in zf.namelist():
             for row in read_csv_member(zf, member):
                 consider(circulating, row["CNPJ_Companhia"].strip(), row["Data_Referencia"].strip(), row.get("Quantidade_Total_Acoes_Circulacao", ""))
 
-    # Prefer total shares issued (capital_social); fall back to shares in
-    # circulation for companies that only reported the latter.
+    # Apply worst-to-best so the most-preferred available type wins per
+    # company, regardless of which years/types happened to have data.
     result = {cnpj: shares for cnpj, (ref, shares) in circulating.items()}
-    result.update({cnpj: shares for cnpj, (ref, shares) in issued.items()})
+    for tipo in sorted(CAPITAL_TYPE_RANK, key=lambda t: -CAPITAL_TYPE_RANK[t]):
+        for cnpj, (ref, shares) in by_type.get(tipo, {}).items():
+            result[cnpj] = shares
     return result
 
 
