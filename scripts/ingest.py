@@ -90,6 +90,30 @@ def fetch_url(url: str, retries: int = 3) -> bytes:
     raise last_err
 
 
+def fetch_json_post(url: str, payload: dict, retries: int = 3) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Referer": "https://www.rad.cvm.gov.br/ENETWeb/frmConsultaExternaCVM.aspx",
+            "User-Agent": "Mozilla/5.0",
+        },
+        method="POST",
+    )
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_err
+
+
 # The 5 insider role categories CVM's VLMO form reports (Tipo_Cargo), mapped
 # to short keys used in the JSON output. "orgaos_tecnicos" is what CVM's own
 # PDF form calls "Órgãos Técnicos ou Consultivos" -- the CSV's Tipo_Cargo
@@ -163,6 +187,64 @@ def compute_monthly(records: list[dict], by_role: bool = False) -> dict:
     return result
 
 
+# CVM's bulk IPE zip for a given year only appears once CVM has published
+# it -- there can be a lag of a few months into a new year where the bulk
+# export for that year doesn't exist at all yet (confirmed: as of Jul 2026,
+# ipe_cia_aberta_2026.zip 404s, while sibling datasets VLMO/FCA already have
+# their 2026 files). LIVE_QUERY_URL is the JSON webmethod behind CVM's own
+# "Consulta de Documentos de Companhias Abertas" search UI
+# (rad.cvm.gov.br/ENETWeb/frmConsultaExternaCVM.aspx) -- undocumented, but
+# it serves the same IPE filings individually by protocol number ahead of
+# the bulk export, so it's used as a fallback to fill that gap. Verified
+# manually against Petrobras: returns the same filings (Nov/2025-Jun/2026)
+# that Fundamentus.com.br's own buyback tab links to.
+LIVE_QUERY_URL = "https://www.rad.cvm.gov.br/ENETWeb/frmConsultaExternaCVM.aspx/ListarDocumentos"
+LIVE_DOWNLOAD_URL = "https://www.rad.cvm.gov.br/ENET/frmDownloadDocumento.aspx?Tela=ext&numProtocolo={protocolo}&descTipo=IPE&CodigoInstituicao=1"
+LIVE_PROTOCOLO_RE = re.compile(r"OpenDownloadDocumentos\('\d+','\d+','(\d+)','IPE'\)")
+LIVE_REF_DATE_RE = re.compile(r"<spanOrder>(\d{8})</spanOrder>")
+
+
+def query_live_ipe_buybacks(cod_cvm: str, data_de: str, data_ate: str) -> list[tuple[str, str]]:
+    """[(month, pdf_url), ...] of buyback filings for one company from CVM's
+    live document-search webmethod, restricted to [data_de, data_ate]
+    (dd/mm/yyyy). Best-effort: any failure (network, unexpected response
+    shape, no filings) just yields no rows rather than raising, since this
+    is a fallback path layered on top of the primary bulk-zip source.
+    """
+    payload = {
+        "dataDe": data_de, "dataAte": data_ate, "empresa": cod_cvm.zfill(6),
+        "setorAtividade": "-1", "categoriaEmissor": "-1", "situacaoEmissor": "-1",
+        "tipoParticipante": "-1", "dataReferencia": "", "categoria": "IPE_-1_-1_-1",
+        "periodo": "2", "horaIni": "", "horaFim": "", "palavraChave": "",
+        "ultimaDtRef": "false", "tipoEmpresa": "0", "token": "", "versaoCaptcha": "",
+    }
+    try:
+        body = fetch_json_post(LIVE_QUERY_URL, payload)
+    except Exception:
+        return []
+    d = body.get("d") or {}
+    if d.get("temErro") or not d.get("dados"):
+        return []
+    rows = []
+    for row in d["dados"].split("&*"):
+        fields = row.split("$&")
+        if len(fields) < 11 or fields[3].strip() != BUYBACK_TIPO:
+            continue
+        ref_match = LIVE_REF_DATE_RE.search(fields[5])
+        proto_match = LIVE_PROTOCOLO_RE.search(fields[10])
+        if not ref_match or not proto_match:
+            continue
+        month = f"{ref_match.group(1)[:4]}-{ref_match.group(1)[4:6]}"
+        rows.append((month, LIVE_DOWNLOAD_URL.format(protocolo=proto_match.group(1))))
+    return rows
+
+
+def _live_fallback_task(args):
+    cnpj, cod_cvm, data_de, data_ate, min_month = args
+    rows = query_live_ipe_buybacks(cod_cvm, data_de, data_ate)
+    return cnpj, [(month, url) for month, url in rows if month >= min_month]
+
+
 def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict, dict]:
     """cnpj -> [(month, pdf_url), ...] for the buyback-specific filing, plus
     cnpj -> company name (needed for companies that have buyback filings but
@@ -170,31 +252,69 @@ def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict,
 
     Restricted to known_cnpjs (companies we already track via VLMO/FCA) to
     avoid spending requests on the long tail of unlisted/inactive filers.
+
+    Years whose bulk zip isn't published yet are filled in via
+    query_live_ipe_buybacks instead of silently dropped.
     """
     filings: dict[str, list[tuple[str, str]]] = {}
     names: dict[str, str] = {}
+    cod_cvm_by_cnpj: dict[str, str] = {}
+    missing_years: list[int] = []
     for year in years:
         url = IPE_URL.format(year=year)
         print(f"Downloading {url}")
         try:
             zf = fetch_zip(url)
         except Exception as e:
-            print(f"  skip {year}: {e}")
+            print(f"  skip {year}: {e} -- will try live document search instead")
+            missing_years.append(year)
             continue
         member = f"ipe_cia_aberta_{year}.csv"
         if member not in zf.namelist():
             continue
         for row in read_csv_member(zf, member):
-            if row.get("Tipo", "").strip() != BUYBACK_TIPO:
-                continue
             cnpj = row["CNPJ_Companhia"].strip()
             if cnpj not in known_cnpjs:
+                continue
+            cod_cvm = row.get("Codigo_CVM", "").strip()
+            if cod_cvm:
+                cod_cvm_by_cnpj[cnpj] = cod_cvm
+            if row.get("Tipo", "").strip() != BUYBACK_TIPO:
                 continue
             names[cnpj] = row["Nome_Companhia"].strip()
             month = row["Data_Referencia"].strip()[:7]
             link = row.get("Link_Download", "").strip()
             if link:
                 filings.setdefault(cnpj, []).append((month, link))
+
+    if missing_years:
+        # CVM's live search backend returns zero rows whenever both ends of
+        # the date range fall inside the same calendar year (confirmed
+        # empirically across several companies and window sizes -- root
+        # cause unknown, but consistently reproducible). Always start the
+        # query a year early so the range crosses a year boundary, then
+        # drop rows outside the year we actually need client-side.
+        today = datetime.date.today()
+        tasks = []
+        for year in missing_years:
+            data_de = f"01/01/{year - 1}"
+            data_ate = today.strftime("%d/%m/%Y") if year == today.year else f"31/12/{year}"
+            min_month = f"{year}-01"
+            for cnpj in known_cnpjs:
+                cod_cvm = cod_cvm_by_cnpj.get(cnpj)
+                if cod_cvm:
+                    tasks.append((cnpj, cod_cvm, data_de, data_ate, min_month))
+        print(f"Live-querying {len(tasks)} companies for {missing_years} (bulk export not published yet)...")
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            for cnpj, rows in pool.map(_live_fallback_task, tasks):
+                done += 1
+                if done % 100 == 0:
+                    print(f"  ...{done}/{len(tasks)}")
+                if rows:
+                    filings.setdefault(cnpj, []).extend(rows)
+        print(f"Live search found buyback filings for {len({t[0] for t in tasks if filings.get(t[0])})} companies")
+
     return filings, names
 
 
