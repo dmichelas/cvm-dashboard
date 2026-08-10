@@ -23,6 +23,7 @@ import json
 import os
 import pathlib
 import re
+import socket
 import statistics
 import time
 import urllib.request
@@ -75,6 +76,30 @@ def read_csv_member(zf: zipfile.ZipFile, name: str):
     with zf.open(name) as f:
         text = io.TextIOWrapper(f, encoding="latin-1", newline="")
         yield from csv.DictReader(text, delimiter=";")
+
+
+# dados.cvm.gov.br publishes an AAAA record (2804:3e68:170::66) alongside
+# its A record, but GitHub's runners have no working IPv6 route -- so any
+# attempt over v6 dies instantly with "Network is unreachable". That is the
+# error that killed every fetch in the 2026-08-10 run, and it hit only
+# dados.cvm.gov.br; rad.cvm.gov.br, which has no AAAA record, was never
+# implicated. Reproduced locally: curl -6 to that host fails in 4ms while
+# curl -4 returns 200.
+#
+# Ordinarily socket.create_connection walks every address getaddrinfo
+# returns and falls back from v6 to v4, which would have saved the run --
+# so the resolver there most likely returned the v6 address alone. Sorting
+# v4 first wouldn't help in that case; only refusing to ask for v6 does.
+# Every CVM host this script touches resolves over IPv4, so pin lookups to
+# AF_INET rather than leave the run at the mercy of the runner's resolver.
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, *args, **kwargs):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, *args, **kwargs)
+
+
+socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 
 def fetch_url(url: str, retries: int = 3) -> bytes:
