@@ -20,6 +20,7 @@ import csv
 import datetime
 import io
 import json
+import os
 import pathlib
 import re
 import statistics
@@ -545,6 +546,61 @@ def monthly_dict_to_rows(monthly: dict, cnpj_digits: str, name: str, company_tic
     return rows
 
 
+# Every loader here catches its own fetch failure, prints a skip, and
+# returns empty -- correct per-source (one missing year shouldn't sink a
+# run) but it makes a total outage indistinguishable from "CVM has no
+# data": the run completes cleanly, writes nothing, and exits 0. Verified
+# on 2026-08-10, when every CVM request from the GitHub runner failed with
+# "Network is unreachable" and the pipeline overwrote a healthy
+# 506-company dataset with 0 companies, committed it, and published a
+# blank dashboard. So compare against the dataset already on disk and
+# refuse to write when it shrinks materially. Set ALLOW_DATA_SHRINK=1 to
+# override, for the rare case where CVM genuinely revises data downward.
+MIN_RETAINED_FRACTION = 0.9
+
+
+def assert_not_degraded(all_cnpjs: set, companies: dict, buybacks: dict):
+    """Aborts before any file is written if this run's data is drastically
+    smaller than the previous one -- the signature of a failed fetch rather
+    than a real change. All network I/O happens before this point, so
+    tripping here leaves the committed dataset untouched.
+    """
+    prev_path = OUT_DIR / "companies.json"
+    if not prev_path.exists():
+        if not all_cnpjs:
+            raise SystemExit("ABORT: produced 0 companies and there is no previous dataset to fall back on")
+        return
+    with open(prev_path, encoding="utf-8") as f:
+        prev = json.load(f)
+
+    checks = [
+        ("companies", len(all_cnpjs), len(prev)),
+        ("insider records",
+         sum(len(c["insiders"]) for c in companies.values()),
+         sum(c.get("insider_count", 0) for c in prev)),
+        ("buyback records",
+         sum(len(b["records"]) for b in buybacks.values()),
+         sum(c.get("buyback_count", 0) for c in prev)),
+    ]
+    problems = [
+        f"  {label}: {new} now vs {old} before ({new / old:.0%})"
+        for label, new, old in checks
+        if old > 0 and new < old * MIN_RETAINED_FRACTION
+    ]
+    if not problems:
+        return
+    if os.environ.get("ALLOW_DATA_SHRINK") == "1":
+        print("WARNING: dataset shrank, writing anyway (ALLOW_DATA_SHRINK=1):")
+        print("\n".join(problems))
+        return
+    raise SystemExit(
+        "ABORT: refusing to overwrite the published dataset -- this run lost data:\n"
+        + "\n".join(problems)
+        + "\n\nUsually means the CVM fetches failed (check for skip/404/unreachable above)."
+          "\nRe-run once CVM is reachable, or set ALLOW_DATA_SHRINK=1 if the drop is real."
+    )
+
+
 def main():
     tickers = load_tickers()
     companies = load_transactions()
@@ -555,13 +611,15 @@ def main():
         for cnpj, shares in total_shares_by_cnpj.items()
     }
 
+    all_cnpjs = set(companies.keys()) | set(buybacks.keys())
+    assert_not_degraded(all_cnpjs, companies, buybacks)
+
     BY_COMPANY_DIR.mkdir(parents=True, exist_ok=True)
     index = []
     monthly_rows = []
     bb_monthly_rows = []
     months_seen = set()
 
-    all_cnpjs = set(companies.keys()) | set(buybacks.keys())
     for cnpj in all_cnpjs:
         bb = buybacks.get(cnpj, {"records": [], "monthly": {}})
         data = companies.get(cnpj) or {"name": bb.get("name", ""), "insiders": [], "monthly": {}}
