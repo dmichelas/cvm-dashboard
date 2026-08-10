@@ -140,6 +140,17 @@
 .ranking-section h2 { margin: 0 0 4px; font-size: 20px; }
 .subtitle-small { margin: 0 0 16px; color: var(--text-secondary); font-size: 13px; }
 
+.partial-note {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--role-3);
+  border-radius: 6px;
+  background: rgba(237, 161, 0, 0.09);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
 .tab-row { display: flex; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
 .tab-btn {
   padding: 8px 4px; margin-bottom: -1px; font-size: 14px; font-weight: 500; border: none; background: none;

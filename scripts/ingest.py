@@ -15,6 +15,7 @@ PDF, linked from the general IPE filing index. See parse_buyback_pdf.py.
 
 Needs pdfplumber (see requirements.txt) -- everything else is stdlib.
 """
+import collections
 import concurrent.futures
 import csv
 import datetime
@@ -626,6 +627,41 @@ def assert_not_degraded(all_cnpjs: set, companies: dict, buybacks: dict):
     )
 
 
+# CVM gives companies until the 10th of the following month to file their
+# Art. 11 disclosures, and its bulk export lags a couple of days behind
+# that. So the newest month is always a partially-filed month: on
+# 2026-08-10 July held 6 buyback rows against 19-36 for every settled
+# month, and 73 insider rows against 245-285 -- not missing data, just
+# most companies not having filed yet (confirmed against CVM's live
+# search: Vale, Gerdau, PRIO et al. had no July filing anywhere yet).
+# Reporting that month like a settled one reads as "buybacks collapsed",
+# so flag it and let the frontend say so.
+PARTIAL_MONTH_FRACTION = 0.5
+
+
+def partial_tail_months(rows: list[dict], lookback: int = 12) -> list[str]:
+    """The trailing months whose row count is far below recent norms.
+
+    Walks backwards from the newest month and stops at the first one that
+    looks settled -- filings only ever arrive late, so a thin month in the
+    middle of the series is a real signal about that month, not an
+    artefact of when the pipeline happened to run.
+    """
+    counts = collections.Counter(r["month"] for r in rows)
+    months = sorted(counts)
+    partial = []
+    for month in reversed(months):
+        baseline = [counts[m] for m in months if m < month][-lookback:]
+        if len(baseline) < 3:
+            break  # too little history to call anything anomalous
+        median = statistics.median(baseline)
+        if median > 0 and counts[month] < median * PARTIAL_MONTH_FRACTION:
+            partial.append(month)
+        else:
+            break
+    return sorted(partial)
+
+
 def main():
     tickers = load_tickers()
     companies = load_transactions()
@@ -695,6 +731,10 @@ def main():
             "company_count": len(index),
             "last_complete_month": last_complete_month,
             "available_months": sorted(months_seen),
+            "partial_months": {
+                "insiders": partial_tail_months(monthly_rows),
+                "buybacks": partial_tail_months(bb_monthly_rows),
+            },
         }, f)
 
     print(f"Wrote {len(index)} companies, {len(monthly_rows)} insider monthly rows, "

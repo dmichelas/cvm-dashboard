@@ -476,15 +476,27 @@ const groupToggle = document.getElementById("group-toggle");
 const rankingTbody = document.getElementById("ranking-tbody");
 const rankingTable = document.getElementById("ranking-table");
 const rankingEmpty = document.getElementById("ranking-empty");
+const rankingPartialNote = document.getElementById("ranking-partial-note");
 const rankingTitle = document.getElementById("ranking-title");
 const rankingSubtitle = document.getElementById("ranking-subtitle");
 const tabInsidersBtn = document.getElementById("tab-insiders");
 const tabBuybacksBtn = document.getElementById("tab-buybacks");
 
+function partialMonths(tab) {
+  return new Set((rankingMeta.partial_months || {})[tab] || []);
+}
+
+// Default to the newest *settled* month. The newest month overall is
+// normally still inside CVM's filing window (companies have until the
+// 10th of the following month), so opening on it shows a fraction of the
+// real activity and reads as a collapse. The month stays selectable --
+// renderRanking just labels it as still coming in.
 function latestMonthWithData(tab) {
   const months = rankingDatasets[tab].map(r => r.month);
   if (months.length === 0) return rankingMeta.last_complete_month;
-  return months.reduce((a, b) => (a > b ? a : b));
+  const partial = partialMonths(tab);
+  const settled = months.filter(m => !partial.has(m));
+  return (settled.length ? settled : months).reduce((a, b) => (a > b ? a : b));
 }
 
 function initRanking(meta, monthly, bbMonthly) {
@@ -701,9 +713,27 @@ function buildRankingRows() {
   }));
 }
 
+// Warns when the user is looking at a month CVM is still collecting, so a
+// thin table doesn't get read as low activity.
+function renderPartialNote() {
+  const partial = partialMonths(activeTab);
+  const shown = [...selectedMonths].filter(m => partial.has(m)).sort();
+  if (shown.length === 0) {
+    rankingPartialNote.hidden = true;
+    return;
+  }
+  const labels = shown.map(monthLabel).join(", ");
+  const noun = shown.length === 1 ? "Mês ainda em consolidação" : "Meses ainda em consolidação";
+  rankingPartialNote.textContent =
+    `${noun}: ${labels}. As companhias têm até o dia 10 do mês seguinte para declarar à CVM, ` +
+    `então parte das operações ainda não foi divulgada e os totais devem aumentar.`;
+  rankingPartialNote.hidden = false;
+}
+
 function renderRanking() {
   if (!rankingMeta) return;
   let rows = buildRankingRows();
+  renderPartialNote();
 
   rows.sort((a, b) => {
     let av, bv;
