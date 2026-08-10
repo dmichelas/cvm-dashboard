@@ -356,9 +356,18 @@ def fetch_and_parse_buyback(args) -> tuple[str, str, list[dict]]:
         return cnpj, month, []
 
 
-def load_buybacks(years: list[int], known_cnpjs: set[str]) -> dict[str, dict]:
-    """cnpj -> {"name": ..., "records": [...], "monthly": {...}}, parsed from PDFs."""
+def load_buybacks(years: list[int], known_cnpjs: set[str]) -> tuple[dict[str, dict], dict[str, int]]:
+    """cnpj -> {"name": ..., "records": [...], "monthly": {...}}, parsed from
+    PDFs, plus month -> number of companies that filed for that month.
+
+    The filing count comes from the IPE index rather than the parsed
+    records because most buyback filings report no trades at all: counting
+    parsed records would measure activity, where the caller needs coverage.
+    """
     filings, names = load_buyback_filings(years, known_cnpjs)
+    filing_counts = collections.Counter(
+        month for entries in filings.values() for month, _ in entries
+    )
     tasks = [(cnpj, month, url) for cnpj, entries in filings.items() for month, url in entries]
     print(f"Fetching {len(tasks)} buyback filings...")
 
@@ -375,7 +384,7 @@ def load_buybacks(years: list[int], known_cnpjs: set[str]) -> dict[str, dict]:
     for company in result.values():
         company["monthly"] = compute_monthly(company["records"])
     print(f"Parsed buyback activity for {len(result)} companies")
-    return result
+    return result, filing_counts
 
 
 # Preference order for FRE's capital_social Tipo_Capital when a company
@@ -628,34 +637,39 @@ def assert_not_degraded(all_cnpjs: set, companies: dict, buybacks: dict):
 
 
 # CVM gives companies until the 10th of the following month to file their
-# Art. 11 disclosures, and its bulk export lags a couple of days behind
-# that. So the newest month is always a partially-filed month: on
-# 2026-08-10 July held 6 buyback rows against 19-36 for every settled
-# month, and 73 insider rows against 245-285 -- not missing data, just
-# most companies not having filed yet (confirmed against CVM's live
-# search: Vale, Gerdau, PRIO et al. had no July filing anywhere yet).
-# Reporting that month like a settled one reads as "buybacks collapsed",
-# so flag it and let the frontend say so.
-PARTIAL_MONTH_FRACTION = 0.5
+# Art. 11 disclosures, and its bulk export trails delivery by ~2 days, so
+# the newest month is always partially filed. Reporting it like a settled
+# one reads as "buybacks collapsed" (on 2026-08-10 July showed 6 buyback
+# rows against 19-36 for settled months), so flag it for the frontend.
+#
+# Coverage is measured as *how many companies filed*, not how many rows
+# they generated. Rows count only companies that actually traded, which
+# swings wildly on its own -- settled buyback months ranged 19-36 rows
+# (+/-33%) while the filing count behind them held at 251-262 (+/-2%).
+# Any threshold high enough to catch a half-filed month would therefore
+# false-flag a genuinely quiet one if it went by rows: April 2026 had 19
+# rows, 73% of the median, while being completely filed. Filing counts
+# separate cleanly, so the threshold can sit high enough to catch the
+# ~55%-covered month the 11th-of-month run sees.
+PARTIAL_MONTH_FRACTION = 0.8
 
 
-def partial_tail_months(rows: list[dict], lookback: int = 12) -> list[str]:
-    """The trailing months whose row count is far below recent norms.
+def partial_tail_months(coverage: dict[str, int], published: set[str], lookback: int = 12) -> list[str]:
+    """The trailing published months whose filing count is far below recent norms.
 
     Walks backwards from the newest month and stops at the first one that
     looks settled -- filings only ever arrive late, so a thin month in the
     middle of the series is a real signal about that month, not an
     artefact of when the pipeline happened to run.
     """
-    counts = collections.Counter(r["month"] for r in rows)
-    months = sorted(counts)
+    months = sorted(published)
     partial = []
     for month in reversed(months):
-        baseline = [counts[m] for m in months if m < month][-lookback:]
+        baseline = [coverage.get(m, 0) for m in months if m < month][-lookback:]
         if len(baseline) < 3:
             break  # too little history to call anything anomalous
         median = statistics.median(baseline)
-        if median > 0 and counts[month] < median * PARTIAL_MONTH_FRACTION:
+        if median > 0 and coverage.get(month, 0) < median * PARTIAL_MONTH_FRACTION:
             partial.append(month)
         else:
             break
@@ -665,7 +679,7 @@ def partial_tail_months(rows: list[dict], lookback: int = 12) -> list[str]:
 def main():
     tickers = load_tickers()
     companies = load_transactions()
-    buybacks = load_buybacks(YEARS, known_cnpjs=set(tickers.keys()))
+    buybacks, bb_filing_counts = load_buybacks(YEARS, known_cnpjs=set(tickers.keys()))
     total_shares_by_cnpj = load_total_shares()
     total_shares = {
         "".join(ch for ch in cnpj if ch.isdigit()): shares
@@ -674,6 +688,14 @@ def main():
 
     all_cnpjs = set(companies.keys()) | set(buybacks.keys())
     assert_not_degraded(all_cnpjs, companies, buybacks)
+
+    # Same coverage measure as bb_filing_counts: one per company that filed
+    # for a month, regardless of whether it reported any trades.
+    insider_filing_counts = collections.Counter(
+        month
+        for data in companies.values()
+        for month in {r["ref"][:7] for r in data["insiders"] if r.get("ref")}
+    )
 
     BY_COMPANY_DIR.mkdir(parents=True, exist_ok=True)
     index = []
@@ -732,8 +754,8 @@ def main():
             "last_complete_month": last_complete_month,
             "available_months": sorted(months_seen),
             "partial_months": {
-                "insiders": partial_tail_months(monthly_rows),
-                "buybacks": partial_tail_months(bb_monthly_rows),
+                "insiders": partial_tail_months(insider_filing_counts, months_seen),
+                "buybacks": partial_tail_months(bb_filing_counts, months_seen),
             },
         }, f)
 
