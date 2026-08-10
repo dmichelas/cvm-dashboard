@@ -2,12 +2,14 @@ name: Update CVM data
 
 on:
   schedule:
-    # 11th of each month at 12:00 UTC = 04:00 PST. Companies have until the
-    # 10th to file their Art. 11 disclosures, so this runs once a month's
-    # filing window has closed rather than while it is still open (see
-    # partial_tail_months in scripts/ingest.py). GitHub cron is UTC-only and
-    # does not follow DST, so this lands at 05:00 Pacific under PDT.
-    - cron: "0 12 11 * *"
+    # 11th, 12th and 14th of each month at 12:00 UTC = 04:00 PST, catching
+    # filings as they trickle in. Companies have until the 10th to file
+    # their Art. 11 disclosures and CVM's bulk export trails delivery by
+    # ~2 days, so coverage of the month just closed runs roughly 55% on the
+    # 11th, ~95% on the 12th (the deadline-day batch lands here) and ~96%
+    # on the 14th. GitHub cron is UTC-only and does not follow DST, so
+    # these fire at 05:00 Pacific under PDT.
+    - cron: "0 12 11,12,14 * *"
   workflow_dispatch: {}
 
 permissions:
