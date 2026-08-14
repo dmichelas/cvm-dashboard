@@ -267,9 +267,49 @@ def query_live_ipe_buybacks(cod_cvm: str, data_de: str, data_ate: str) -> list[t
 
 
 def _live_fallback_task(args):
-    cnpj, cod_cvm, data_de, data_ate, min_month = args
+    cnpj, cod_cvm, data_de, data_ate, wanted = args
     rows = query_live_ipe_buybacks(cod_cvm, data_de, data_ate)
-    return cnpj, [(month, url) for month, url in rows if month >= min_month]
+    return cnpj, [(month, url) for month, url in rows if month in wanted]
+
+
+def _recent_months(today: datetime.date, count: int) -> list[str]:
+    """The `count` reference months ending with the one before `today`."""
+    months = []
+    year, month = today.year, today.month
+    for _ in range(count):
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+        months.append(f"{year}-{month:02d}")
+    return months
+
+
+def _months_needing_live(filings: dict, missing_years: list[int], today: datetime.date,
+                         lookback: int = 12, fraction: float = 0.8) -> set[str]:
+    """Reference months the live search should fill in.
+
+    Covers two failure modes. A year's bulk zip may not exist yet, which
+    was the original case. Or the zip exists but has stopped being
+    refreshed -- on 2026-08-14 every CVM bulk export still carried
+    Last-Modified 2026-08-09, so July sat at 84 filings against ~250 for
+    settled months while the filings themselves were already served by
+    CVM's live search. Only the 404 triggered a fallback, so three
+    consecutive runs republished the same stale July.
+    """
+    counts = collections.Counter(month for entries in filings.values() for month, _ in entries)
+    wanted = {m for m in counts if any(m.startswith(str(y)) for y in missing_years)}
+    for year in missing_years:
+        wanted |= {m for m in _recent_months(today, 12) if m.startswith(str(year))}
+
+    months = sorted(counts)
+    for month in _recent_months(today, 3):
+        baseline = [counts[m] for m in months if m < month][-lookback:]
+        if len(baseline) < 3:
+            continue
+        median = statistics.median(baseline)
+        if median > 0 and counts.get(month, 0) < median * fraction:
+            wanted.add(month)
+    return wanted
 
 
 def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict, dict]:
@@ -314,46 +354,82 @@ def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict,
             if link:
                 filings.setdefault(cnpj, []).append((month, link))
 
-    if missing_years:
+    today = datetime.date.today()
+    wanted = _months_needing_live(filings, missing_years, today)
+    if wanted:
         # CVM's live search backend returns zero rows whenever both ends of
         # the date range fall inside the same calendar year (confirmed
         # empirically across several companies and window sizes -- root
         # cause unknown, but consistently reproducible). Always start the
         # query a year early so the range crosses a year boundary, then
-        # drop rows outside the year we actually need client-side.
-        today = datetime.date.today()
-        tasks = []
-        for year in missing_years:
-            data_de = f"01/01/{year - 1}"
-            data_ate = today.strftime("%d/%m/%Y") if year == today.year else f"31/12/{year}"
-            min_month = f"{year}-01"
-            for cnpj in known_cnpjs:
-                cod_cvm = cod_cvm_by_cnpj.get(cnpj)
-                if cod_cvm:
-                    tasks.append((cnpj, cod_cvm, data_de, data_ate, min_month))
-        print(f"Live-querying {len(tasks)} companies for {missing_years} (bulk export not published yet)...")
+        # drop months we did not ask for client-side.
+        earliest = min(wanted)
+        data_de = f"01/01/{int(earliest[:4]) - 1}"
+        data_ate = today.strftime("%d/%m/%Y")
+        tasks = [
+            (cnpj, cod_cvm_by_cnpj[cnpj], data_de, data_ate, wanted)
+            for cnpj in sorted(known_cnpjs)
+            if cnpj in cod_cvm_by_cnpj
+        ]
+        print(f"Live-querying {len(tasks)} companies for {sorted(wanted)} "
+              f"(bulk export missing or behind)...")
+
+        # The bulk export is authoritative where it has data; live results
+        # only fill company-months it is missing, so a month half-published
+        # in bulk doesn't get its filings counted twice.
+        have = {(cnpj, month) for cnpj, entries in filings.items() for month, _ in entries}
+        added = 0
         done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
             for cnpj, rows in pool.map(_live_fallback_task, tasks):
                 done += 1
                 if done % 100 == 0:
                     print(f"  ...{done}/{len(tasks)}")
-                if rows:
-                    filings.setdefault(cnpj, []).extend(rows)
-        print(f"Live search found buyback filings for {len({t[0] for t in tasks if filings.get(t[0])})} companies")
+                for month, url in rows:
+                    if (cnpj, month) in have:
+                        continue
+                    have.add((cnpj, month))
+                    filings.setdefault(cnpj, []).append((month, url))
+                    added += 1
+        print(f"Live search added {added} filings the bulk export did not have")
 
     return filings, names
 
 
-def fetch_and_parse_buyback(args) -> tuple[str, str, list[dict]]:
+# rad.cvm.gov.br answers some requests with an HTML error/throttle page
+# under HTTP 200. fetch_url sees a valid response and returns it, then
+# pdfplumber rejects it ("No /Root object!") -- which used to be swallowed
+# as "this company had no buybacks". On 2026-08-14 that silently deleted
+# 609 records across 548 filings, shrinking every month in the dataset,
+# and the run still reported success. Check the magic bytes so a bad
+# response is retried rather than believed.
+PDF_MAGIC = b"%PDF"
+
+# Above this share of filings failing after retries, the dataset is too
+# holed to publish: each failure erases one company-month, so a partial
+# fetch looks exactly like companies having stopped buying back.
+MAX_BUYBACK_FAILURE_RATE = 0.02
+
+
+def fetch_and_parse_buyback(args) -> tuple[str, str, list[dict], str]:
+    """Returns (cnpj, month, records, error). error is "" on success.
+
+    An empty record list is a real answer -- most filings report no trades
+    -- so failures are reported out of band rather than as emptiness.
+    """
     cnpj, month, url = args
-    try:
-        pdf_bytes = fetch_url(url)
-        records = parse_buyback_pdf(pdf_bytes, month)
-        return cnpj, month, records
-    except Exception as e:
-        print(f"  buyback fetch failed for {cnpj} {month}: {e}")
-        return cnpj, month, []
+    last_err = None
+    for attempt in range(3):
+        try:
+            pdf_bytes = fetch_url(url)
+            if not pdf_bytes.startswith(PDF_MAGIC):
+                raise ValueError(f"response is not a PDF (starts {pdf_bytes[:24]!r})")
+            return cnpj, month, parse_buyback_pdf(pdf_bytes, month), ""
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2.0 * (attempt + 1))
+    return cnpj, month, [], f"{cnpj} {month}: {last_err}"
 
 
 def load_buybacks(years: list[int], known_cnpjs: set[str]) -> tuple[dict[str, dict], dict[str, int]]:
@@ -372,14 +448,33 @@ def load_buybacks(years: list[int], known_cnpjs: set[str]) -> tuple[dict[str, di
     print(f"Fetching {len(tasks)} buyback filings...")
 
     result: dict[str, dict] = {}
+    failures: list[str] = []
     done = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-        for cnpj, month, records in pool.map(fetch_and_parse_buyback, tasks):
+    # 8 rather than 12: the throttle responses this retries around get more
+    # common the harder rad.cvm.gov.br is pushed.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for cnpj, month, records, error in pool.map(fetch_and_parse_buyback, tasks):
             done += 1
             if done % 250 == 0:
                 print(f"  ...{done}/{len(tasks)}")
+            if error:
+                failures.append(error)
+                continue
             company = result.setdefault(cnpj, {"name": names.get(cnpj, ""), "records": []})
             company["records"].extend(records)
+
+    if failures:
+        rate = len(failures) / len(tasks)
+        print(f"  {len(failures)}/{len(tasks)} filings failed after retries ({rate:.1%})")
+        for line in failures[:5]:
+            print(f"    {line}")
+        if rate > MAX_BUYBACK_FAILURE_RATE:
+            raise SystemExit(
+                f"ABORT: {len(failures)} of {len(tasks)} buyback filings ({rate:.1%}) could not be "
+                f"fetched, over the {MAX_BUYBACK_FAILURE_RATE:.0%} limit.\nEach failure silently "
+                f"erases a company-month, so publishing this would understate buybacks across the "
+                f"whole dataset.\nUsually rad.cvm.gov.br throttling -- re-run later."
+            )
 
     for company in result.values():
         company["monthly"] = compute_monthly(company["records"])
