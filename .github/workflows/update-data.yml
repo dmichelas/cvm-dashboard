@@ -2,14 +2,19 @@ name: Update CVM data
 
 on:
   schedule:
-    # 11th, 12th and 14th of each month at 12:00 UTC = 04:00 PST, catching
-    # filings as they trickle in. Companies have until the 10th to file
-    # their Art. 11 disclosures and CVM's bulk export trails delivery by
-    # ~2 days, so coverage of the month just closed runs roughly 55% on the
-    # 11th, ~95% on the 12th (the deadline-day batch lands here) and ~96%
-    # on the 14th. GitHub cron is UTC-only and does not follow DST, so
-    # these fire at 05:00 Pacific under PDT.
-    - cron: "0 12 11,12,14 * *"
+    # 11th and 14th of each month at 12:00 UTC = 04:00 PST. Companies have
+    # until the 10th to file their Art. 11 disclosures. Data now comes from
+    # CVM's live search in real time (see refresh_from_live_search), not the
+    # bulk export that used to trail delivery by ~2 days -- so the day after
+    # the deadline already reflects ~everything filed, and the old third pull
+    # existed only to wait out that export lag, which is gone.
+    #   * 11th: first read once the filing window has closed (~95%+).
+    #   * 14th: picks up the late-filing / amendment tail, and is the
+    #     insurance pull if the 11th run fails (there is no auto-retry) or the
+    #     10th fell on a weekend and filings slipped to the following week.
+    # GitHub cron is UTC-only and ignores DST, so these fire at 05:00 Pacific
+    # under PDT.
+    - cron: "0 12 11,14 * *"
   workflow_dispatch: {}
 
 permissions:
