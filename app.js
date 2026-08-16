@@ -668,6 +668,17 @@ function fmtPrice(n) {
   return `R$ ${n.toFixed(2).replace(".", ",")}`;
 }
 
+// % do Capital cell: signed (net sale is negative), coloured to match Valor.
+// A magnitude that rounds to zero is shown plain, so tiny sales don't render
+// as a misleading "-0.00%".
+function pctCell(pct) {
+  if (pct == null) return `<td>–</td>`;
+  const text = pct.toFixed(2);
+  const zero = text === "0.00" || text === "-0.00";
+  const cls = zero ? "" : pct >= 0 ? "val-positive" : "val-negative";
+  return `<td class="${cls}">${(zero ? "0.00" : text)}%</td>`;
+}
+
 function buildRankingRows() {
   const dataset = rankingDatasets[activeTab];
   const hasPct = TAB_INFO[activeTab].hasPct;
@@ -702,14 +713,17 @@ function buildRankingRows() {
     g.grossVal += r.gross_val;
     g.months.add(r.month);
     // Total shares is constant per company -- back it out from any one row's
-    // pct so the grouped total can be re-expressed as a percentage too.
-    if (g.shares === null && r.pct) g.shares = Math.abs(r.qty) / (r.pct / 100);
+    // pct so the grouped total can be re-expressed as a percentage too. Both
+    // pct and qty are now signed, so take magnitudes to recover the (always
+    // positive) share count.
+    if (g.shares === null && r.pct) g.shares = Math.abs(r.qty) / Math.abs(r.pct / 100);
   }
   return [...byCompany.values()].map(g => ({
     cnpj_digits: g.cnpj_digits, name: g.name, tickers: g.tickers,
     monthLabel: g.months.size === 1 ? monthLabel([...g.months][0]) : `${g.months.size} meses`,
     val: g.val, qty: Math.abs(g.qty), price: g.grossQty ? g.grossVal / g.grossQty : 0,
-    pct: hasPct && g.shares ? (Math.abs(g.qty) / g.shares) * 100 : null,
+    // Signed by the net quantity, matching Valor.
+    pct: hasPct && g.shares ? (g.qty / g.shares) * 100 : null,
   }));
 }
 
@@ -739,7 +753,7 @@ function renderRanking() {
     let av, bv;
     if (sortKey === "tickers") { av = a.tickers[0] || ""; bv = b.tickers[0] || ""; }
     else if (sortKey === "month") { av = a.monthLabel; bv = b.monthLabel; }
-    else if (sortKey === "pct") { av = a.pct ?? -1; bv = b.pct ?? -1; }
+    else if (sortKey === "pct") { av = a.pct ?? -Infinity; bv = b.pct ?? -Infinity; }
     else { av = a[sortKey]; bv = b[sortKey]; }
     if (av < bv) return sortDir === "asc" ? -1 : 1;
     if (av > bv) return sortDir === "asc" ? 1 : -1;
@@ -764,7 +778,7 @@ function renderRanking() {
       <td class="${r.val >= 0 ? "val-positive" : "val-negative"}">${fmtBRL(r.val)}</td>
       <td>${fmtQty(r.qty)}</td>
       <td>${fmtPrice(r.price)}</td>
-      <td>${r.pct != null ? r.pct.toFixed(2) + "%" : "–"}</td>
+      ${pctCell(r.pct)}
     </tr>`).join("");
 
   rankingTbody.querySelectorAll("tr").forEach(tr => {

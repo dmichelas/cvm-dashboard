@@ -803,7 +803,9 @@ def _monthly_row(agg: dict, cnpj_digits: str, name: str, company_tickers: list[s
         row["role"] = role
     if total_shares is not None:
         shares = total_shares.get(cnpj_digits)
-        row["pct"] = abs(qty) / shares * 100 if shares else None
+        # Signed: a net sale (qty < 0) shows as a negative % of capital, so
+        # the column reads the same direction as Valor.
+        row["pct"] = qty / shares * 100 if shares else None
     return row
 
 
