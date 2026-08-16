@@ -30,7 +30,7 @@ import time
 import urllib.request
 import zipfile
 
-from parse_buyback_pdf import parse_buyback_pdf
+from parse_buyback_pdf import parse_buyback_pdf, parse_position_pdf
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT_DIR = ROOT / "data"
@@ -45,6 +45,7 @@ IPE_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/IPE/DADOS/ipe_cia_abert
 FRE_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/FRE/DADOS/fre_cia_aberta_{year}.zip"
 FRE_YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1, CURRENT_YEAR - 2]
 BUYBACK_TIPO = "Posição Individual - Cia, Controladas e Coligadas"
+INSIDER_TIPO = "Posição Consolidada"
 
 TRADE_MOVEMENTS = {
     "Compra", "Compra à vista", "Compra à termo",
@@ -153,6 +154,12 @@ ROLE_KEYS = {
     "Órgão Estatutário ou Vinculado": "orgaos_tecnicos",
 }
 
+# Insider records parsed from the live PDF carry the short role key that
+# parse_position_pdf reads off the form's checkbox; VLMO's structured rows
+# carry the full Tipo_Cargo label. compute_monthly's by_role step matches
+# on the full label, so live records are mapped back to it before merging.
+ROLE_KEY_TO_LABEL = {v: k for k, v in ROLE_KEYS.items()}
+
 
 def _aggregate_records(records: list[dict]) -> dict:
     """Sums signed qty/value plus gross (unsigned) qty/value for Preço Médio
@@ -231,45 +238,45 @@ LIVE_PROTOCOLO_RE = re.compile(r"OpenDownloadDocumentos\('\d+','\d+','(\d+)','IP
 LIVE_REF_DATE_RE = re.compile(r"<spanOrder>(\d{8})</spanOrder>")
 
 
-def query_live_ipe_buybacks(cod_cvm: str, data_de: str, data_ate: str) -> list[tuple[str, str]]:
-    """[(month, pdf_url), ...] of buyback filings for one company from CVM's
-    live document-search webmethod, restricted to [data_de, data_ate]
-    (dd/mm/yyyy). Best-effort: any failure (network, unexpected response
-    shape, no filings) just yields no rows rather than raising, since this
-    is a fallback path layered on top of the primary bulk-zip source.
+def iter_live_market_index(data_de: str, data_ate: str):
+    """Yield (code, name, tipo, ref_month, proto) for every Art. 11 "Valores
+    Mobiliários Negociados e Detidos" filing *delivered* in [data_de,
+    data_ate] (dd/mm/yyyy), across the whole market.
+
+    This is CVM's live ENET document search -- the same source Fundamentus
+    reads -- which serves each filing the moment it's received, unlike the
+    bulk VLMO/IPE exports that trail delivery by ~2 days and periodically
+    freeze for a week or more. A market-wide query (empresa empty) returns
+    every company's filings of both position types in a single request, and
+    unlike the per-company form has no same-calendar-year restriction.
+    `code` is CVM's numeric company code (int); `tipo` is BUYBACK_TIPO or
+    INSIDER_TIPO.
     """
     payload = {
-        "dataDe": data_de, "dataAte": data_ate, "empresa": cod_cvm.zfill(6),
+        "dataDe": data_de, "dataAte": data_ate, "empresa": "",
         "setorAtividade": "-1", "categoriaEmissor": "-1", "situacaoEmissor": "-1",
         "tipoParticipante": "-1", "dataReferencia": "", "categoria": "IPE_-1_-1_-1",
         "periodo": "2", "horaIni": "", "horaFim": "", "palavraChave": "",
         "ultimaDtRef": "false", "tipoEmpresa": "0", "token": "", "versaoCaptcha": "",
     }
-    try:
-        body = fetch_json_post(LIVE_QUERY_URL, payload)
-    except Exception:
-        return []
+    body = fetch_json_post(LIVE_QUERY_URL, payload)
     d = body.get("d") or {}
     if d.get("temErro") or not d.get("dados"):
-        return []
-    rows = []
+        return
     for row in d["dados"].split("&*"):
-        fields = row.split("$&")
-        if len(fields) < 11 or fields[3].strip() != BUYBACK_TIPO:
+        f = row.split("$&")
+        if len(f) < 11:
             continue
-        ref_match = LIVE_REF_DATE_RE.search(fields[5])
-        proto_match = LIVE_PROTOCOLO_RE.search(fields[10])
-        if not ref_match or not proto_match:
+        tipo = f[3].strip()
+        if tipo not in (BUYBACK_TIPO, INSIDER_TIPO):
             continue
-        month = f"{ref_match.group(1)[:4]}-{ref_match.group(1)[4:6]}"
-        rows.append((month, LIVE_DOWNLOAD_URL.format(protocolo=proto_match.group(1))))
-    return rows
-
-
-def _live_fallback_task(args):
-    cnpj, cod_cvm, data_de, data_ate, wanted = args
-    rows = query_live_ipe_buybacks(cod_cvm, data_de, data_ate)
-    return cnpj, [(month, url) for month, url in rows if month in wanted]
+        ref = LIVE_REF_DATE_RE.search(f[5])
+        proto = LIVE_PROTOCOLO_RE.search(f[10])
+        code = re.sub(r"\D", "", f[0])
+        if not ref or not proto or not code:
+            continue
+        ref_month = f"{ref.group(1)[:4]}-{ref.group(1)[4:6]}"
+        yield int(code), f[1].strip(), tipo, ref_month, proto.group(1)
 
 
 def _recent_months(today: datetime.date, count: int) -> list[str]:
@@ -284,48 +291,201 @@ def _recent_months(today: datetime.date, count: int) -> list[str]:
     return months
 
 
-def _months_needing_live(filings: dict, missing_years: list[int], today: datetime.date,
-                         lookback: int = 12, fraction: float = 0.8) -> set[str]:
-    """Reference months the live search should fill in.
+def months_to_refresh(counts: dict[str, int], missing_years: list[int], today: datetime.date,
+                      window_floor: str, lookback: int = 12, fraction: float = 0.8) -> set[str]:
+    """Reference months whose bulk data should be replaced from live search.
 
-    Covers two failure modes. A year's bulk zip may not exist yet, which
-    was the original case. Or the zip exists but has stopped being
-    refreshed -- on 2026-08-14 every CVM bulk export still carried
-    Last-Modified 2026-08-09, so July sat at 84 filings against ~250 for
-    settled months while the filings themselves were already served by
-    CVM's live search. Only the 404 triggered a fallback, so three
-    consecutive runs republished the same stale July.
+    Two failure modes, both seen in practice:
+      * a year's bulk zip 404s entirely (July 2026: ipe_cia_aberta_2026.zip
+        did not exist yet) -- every month of that year needs live data;
+      * the zip exists but has stopped refreshing (Aug 2026: every export
+        frozen at Last-Modified 2026-08-09, so July sat at ~30% of a normal
+        month's filings) -- recent months fall below their historical norm.
+    Bounded to months at or after window_floor (the displayed range) so a
+    stale older year doesn't trigger a full re-parse.
     """
-    counts = collections.Counter(month for entries in filings.values() for month, _ in entries)
-    wanted = {m for m in counts if any(m.startswith(str(y)) for y in missing_years)}
+    wanted = set()
     for year in missing_years:
-        wanted |= {m for m in _recent_months(today, 12) if m.startswith(str(year))}
-
+        wanted |= {m for m in _recent_months(today, 24)
+                   if m.startswith(str(year)) and m >= window_floor}
     months = sorted(counts)
-    for month in _recent_months(today, 3):
+    for month in _recent_months(today, 4):
+        if month < window_floor:
+            continue
         baseline = [counts[m] for m in months if m < month][-lookback:]
         if len(baseline) < 3:
+            wanted.add(month)  # no settled history yet -- treat as needing fill
             continue
         median = statistics.median(baseline)
-        if median > 0 and counts.get(month, 0) < median * fraction:
+        if median == 0 or counts.get(month, 0) < median * fraction:
             wanted.add(month)
     return wanted
 
 
-def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict, dict]:
+def collect_live_index(ref_months: set[str], code_to_cnpj: dict[int, str],
+                       today: datetime.date, span_days: int = 15) -> dict:
+    """(cnpj, tipo, ref_month) -> {proto} for every wanted filing, gathered
+    by sweeping delivery-date windows market-wide.
+
+    Filings for a reference month are delivered from that month onward
+    (mostly by the 10th of the next month, corrections later), so the sweep
+    runs from the first of the earliest wanted month to today in span_days
+    chunks -- small enough that each market query stays fast and reliable.
+    Filings whose company code isn't in our FCA-derived universe are
+    dropped.
+    """
+    if not ref_months:
+        return {}
+    earliest = min(ref_months)
+    start = datetime.date(int(earliest[:4]), int(earliest[5:7]), 1)
+    index: dict = {}
+    seen_proto: set = set()
+    cur = start
+    while cur <= today:
+        end = min(cur + datetime.timedelta(days=span_days - 1), today)
+        de, ate = cur.strftime("%d/%m/%Y"), end.strftime("%d/%m/%Y")
+        try:
+            rows = list(iter_live_market_index(de, ate))
+        except Exception as e:
+            print(f"  live index {de}..{ate} failed: {e}")
+            cur = end + datetime.timedelta(days=1)
+            continue
+        for code, name, tipo, ref_month, proto in rows:
+            if ref_month not in ref_months or proto in seen_proto:
+                continue
+            cnpj = code_to_cnpj.get(code)
+            if not cnpj:
+                continue
+            seen_proto.add(proto)
+            index.setdefault((cnpj, tipo, ref_month), set()).add(proto)
+        cur = end + datetime.timedelta(days=1)
+    return index
+
+
+def _fetch_parse_live(args):
+    """(key, proto) -> (key, proto, records, error). key is (cnpj, tipo,
+    month). Buyback PDFs parse without a role; consolidated insider PDFs
+    parse with the governance-group role read off the form."""
+    key, proto = args
+    cnpj, tipo, month = key
+    with_role = tipo == INSIDER_TIPO
+    url = LIVE_DOWNLOAD_URL.format(protocolo=proto)
+    last_err = None
+    for attempt in range(3):
+        try:
+            b = fetch_url(url)
+            if not b.startswith(PDF_MAGIC):
+                raise ValueError(f"response is not a PDF (starts {b[:24]!r})")
+            return key, proto, parse_position_pdf(b, month, with_role=with_role), ""
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2.0 * (attempt + 1))
+    return key, proto, [], f"{cnpj} {tipo[:20]} {month} proto {proto}: {last_err}"
+
+
+def refresh_from_live_search(companies: dict, buybacks: dict, live_names: dict,
+                             code_to_cnpj: dict, keep_cnpjs: set, ins_months: set,
+                             bb_months: set, today: datetime.date):
+    """Replace the given reference months, in place, with live ENET data for
+    both insiders (companies[cnpj]['insiders']) and buybacks
+    (buybacks[cnpj]['records']). Every other month is left exactly as the
+    bulk export produced it. Aborts if too many PDFs fail, since each
+    failure would silently drop a company-month.
+    """
+    want = {(BUYBACK_TIPO, m) for m in bb_months} | {(INSIDER_TIPO, m) for m in ins_months}
+    if not want:
+        return {}
+    all_months = ins_months | bb_months
+    print(f"Live refresh: insiders {sorted(ins_months)} buybacks {sorted(bb_months)}")
+    index = collect_live_index(all_months, code_to_cnpj, today)
+    # Only companies with a ticker reach the ranking tables, same as the bulk
+    # path -- no point fetching PDFs for the rest.
+    index = {k: v for k, v in index.items() if k[0] in keep_cnpjs and (k[1], k[2]) in want}
+    tasks = [(k, proto) for k, protos in index.items() for proto in protos]
+    print(f"  {len(tasks)} live filings to fetch across {len(index)} company-months")
+
+    # Filer coverage per refreshed month (distinct companies that filed,
+    # trades or not) -- what the partial-month flag needs. Taken from the
+    # index rather than parsed records, since a no-trade filing yields no
+    # records but still counts as coverage.
+    kind = {BUYBACK_TIPO: "buybacks", INSIDER_TIPO: "insiders"}
+    live_filer_counts: dict = {}
+    for (cnpj, tipo, month) in index:
+        live_filer_counts.setdefault((kind[tipo], month), set()).add(cnpj)
+    live_filer_counts = {k: len(v) for k, v in live_filer_counts.items()}
+
+    # (cnpj, tipo, month) -> {proto: [records]}
+    parsed: dict = {}
+    failures: list[str] = []
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for key, proto, records, error in pool.map(_fetch_parse_live, tasks):
+            done += 1
+            if done % 300 == 0:
+                print(f"  ...{done}/{len(tasks)}")
+            if error:
+                failures.append(error)
+                continue
+            parsed.setdefault(key, {})[proto] = records
+    if failures:
+        rate = len(failures) / max(1, len(tasks))
+        print(f"  {len(failures)}/{len(tasks)} live filings failed ({rate:.1%})")
+        for line in failures[:5]:
+            print(f"    {line}")
+        if rate > MAX_BUYBACK_FAILURE_RATE:
+            raise SystemExit(
+                f"ABORT: {len(failures)}/{len(tasks)} live filings ({rate:.1%}) failed, over the "
+                f"{MAX_BUYBACK_FAILURE_RATE:.0%} limit. Each failure drops a company-month; "
+                f"publishing would understate recent activity. Usually rad.cvm.gov.br "
+                f"throttling -- re-run later."
+            )
+
+    touched_ins, touched_bb = set(), set()
+    for (cnpj, tipo, month), by_proto in parsed.items():
+        if tipo == BUYBACK_TIPO:
+            best = max(by_proto)  # latest version supersedes corrections
+            recs = by_proto[best]
+            store = buybacks.setdefault(cnpj, {"name": live_names.get(cnpj, ""), "records": []})
+            store["records"] = [r for r in store["records"] if r["ref"][:7] != month] + recs
+            touched_bb.add(cnpj)
+        else:
+            # One consolidated doc per governance group; keep the highest-proto
+            # doc per role (dedups version corrections, keeps distinct groups).
+            docs = list(by_proto.items())
+            roles = {r.get("role") for _, recs in docs for r in recs}
+            merged = []
+            for role in roles:
+                best = max(p for p, recs in docs if any(r.get("role") == role for r in recs))
+                for r in by_proto[best]:
+                    if r.get("role") != role:
+                        continue
+                    r = dict(r, role=ROLE_KEY_TO_LABEL.get(role, role))
+                    merged.append(r)
+            data = companies.setdefault(cnpj, {"name": live_names.get(cnpj, ""),
+                                               "insiders": [], "monthly": {}})
+            data["insiders"] = [r for r in data["insiders"] if r["ref"][:7] != month] + merged
+            touched_ins.add(cnpj)
+
+    for cnpj in touched_bb:
+        buybacks[cnpj]["monthly"] = compute_monthly(buybacks[cnpj]["records"])
+    for cnpj in touched_ins:
+        companies[cnpj]["monthly"] = compute_monthly(companies[cnpj]["insiders"], by_role=True)
+    print(f"  refreshed {len(touched_ins)} companies' insiders, {len(touched_bb)} buybacks from live")
+    return live_filer_counts
+
+
+def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict, dict, list[int]]:
     """cnpj -> [(month, pdf_url), ...] for the buyback-specific filing, plus
-    cnpj -> company name (needed for companies that have buyback filings but
-    no insider ones, so main() has a name to write even for those).
+    cnpj -> company name and the list of years whose bulk zip was missing.
 
     Restricted to known_cnpjs (companies we already track via VLMO/FCA) to
     avoid spending requests on the long tail of unlisted/inactive filers.
-
-    Years whose bulk zip isn't published yet are filled in via
-    query_live_ipe_buybacks instead of silently dropped.
+    Recent or missing months are filled from CVM's live search later, in
+    refresh_from_live_search, which is authoritative for those months.
     """
     filings: dict[str, list[tuple[str, str]]] = {}
     names: dict[str, str] = {}
-    cod_cvm_by_cnpj: dict[str, str] = {}
     missing_years: list[int] = []
     for year in years:
         url = IPE_URL.format(year=year)
@@ -333,7 +493,7 @@ def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict,
         try:
             zf = fetch_zip(url)
         except Exception as e:
-            print(f"  skip {year}: {e} -- will try live document search instead")
+            print(f"  skip {year}: {e} -- live search will backfill this year")
             missing_years.append(year)
             continue
         member = f"ipe_cia_aberta_{year}.csv"
@@ -343,9 +503,6 @@ def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict,
             cnpj = row["CNPJ_Companhia"].strip()
             if cnpj not in known_cnpjs:
                 continue
-            cod_cvm = row.get("Codigo_CVM", "").strip()
-            if cod_cvm:
-                cod_cvm_by_cnpj[cnpj] = cod_cvm
             if row.get("Tipo", "").strip() != BUYBACK_TIPO:
                 continue
             names[cnpj] = row["Nome_Companhia"].strip()
@@ -354,46 +511,7 @@ def load_buyback_filings(years: list[int], known_cnpjs: set[str]) -> tuple[dict,
             if link:
                 filings.setdefault(cnpj, []).append((month, link))
 
-    today = datetime.date.today()
-    wanted = _months_needing_live(filings, missing_years, today)
-    if wanted:
-        # CVM's live search backend returns zero rows whenever both ends of
-        # the date range fall inside the same calendar year (confirmed
-        # empirically across several companies and window sizes -- root
-        # cause unknown, but consistently reproducible). Always start the
-        # query a year early so the range crosses a year boundary, then
-        # drop months we did not ask for client-side.
-        earliest = min(wanted)
-        data_de = f"01/01/{int(earliest[:4]) - 1}"
-        data_ate = today.strftime("%d/%m/%Y")
-        tasks = [
-            (cnpj, cod_cvm_by_cnpj[cnpj], data_de, data_ate, wanted)
-            for cnpj in sorted(known_cnpjs)
-            if cnpj in cod_cvm_by_cnpj
-        ]
-        print(f"Live-querying {len(tasks)} companies for {sorted(wanted)} "
-              f"(bulk export missing or behind)...")
-
-        # The bulk export is authoritative where it has data; live results
-        # only fill company-months it is missing, so a month half-published
-        # in bulk doesn't get its filings counted twice.
-        have = {(cnpj, month) for cnpj, entries in filings.items() for month, _ in entries}
-        added = 0
-        done = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            for cnpj, rows in pool.map(_live_fallback_task, tasks):
-                done += 1
-                if done % 100 == 0:
-                    print(f"  ...{done}/{len(tasks)}")
-                for month, url in rows:
-                    if (cnpj, month) in have:
-                        continue
-                    have.add((cnpj, month))
-                    filings.setdefault(cnpj, []).append((month, url))
-                    added += 1
-        print(f"Live search added {added} filings the bulk export did not have")
-
-    return filings, names
+    return filings, names, missing_years
 
 
 # rad.cvm.gov.br answers some requests with an HTML error/throttle page
@@ -432,15 +550,15 @@ def fetch_and_parse_buyback(args) -> tuple[str, str, list[dict], str]:
     return cnpj, month, [], f"{cnpj} {month}: {last_err}"
 
 
-def load_buybacks(years: list[int], known_cnpjs: set[str]) -> tuple[dict[str, dict], dict[str, int]]:
+def load_buybacks(years: list[int], known_cnpjs: set[str]) -> tuple[dict[str, dict], dict[str, int], dict[str, str], list[int]]:
     """cnpj -> {"name": ..., "records": [...], "monthly": {...}}, parsed from
-    PDFs, plus month -> number of companies that filed for that month.
+    PDFs, plus month -> filer count, cnpj -> name, and missing bulk years.
 
     The filing count comes from the IPE index rather than the parsed
     records because most buyback filings report no trades at all: counting
     parsed records would measure activity, where the caller needs coverage.
     """
-    filings, names = load_buyback_filings(years, known_cnpjs)
+    filings, names, missing_years = load_buyback_filings(years, known_cnpjs)
     filing_counts = collections.Counter(
         month for entries in filings.values() for month, _ in entries
     )
@@ -479,7 +597,7 @@ def load_buybacks(years: list[int], known_cnpjs: set[str]) -> tuple[dict[str, di
     for company in result.values():
         company["monthly"] = compute_monthly(company["records"])
     print(f"Parsed buyback activity for {len(result)} companies")
-    return result, filing_counts
+    return result, filing_counts, names, missing_years
 
 
 # Preference order for FRE's capital_social Tipo_Capital when a company
@@ -576,8 +694,34 @@ def load_tickers() -> dict[str, list[str]]:
     return {cnpj: sorted(codes) for cnpj, codes in tickers.items()}
 
 
-def load_transactions() -> dict[str, dict]:
-    """cnpj -> {name, insiders: [...], monthly: {...}}
+def load_code_cnpj_map() -> dict[int, str]:
+    """CVM numeric company code -> CNPJ, from FCA's registration table.
+
+    The live ENET search identifies companies by numeric code; the rest of
+    the pipeline keys on CNPJ, so this bridges the two. FCA is a slow-moving
+    registry (code<->CNPJ is effectively static for a listed company), so a
+    week-stale copy during a bulk-export freeze is still fine here.
+    """
+    mapping: dict[int, str] = {}
+    for year in YEARS:
+        try:
+            zf = fetch_zip(FCA_URL.format(year=year))
+        except Exception as e:
+            print(f"  code map skip {year}: {e}")
+            continue
+        member = f"fca_cia_aberta_{year}.csv"
+        if member not in zf.namelist():
+            continue
+        for row in read_csv_member(zf, member):
+            code = re.sub(r"\D", "", row.get("CD_CVM", ""))
+            cnpj = row.get("CNPJ_CIA", "").strip()
+            if code and cnpj:
+                mapping[int(code)] = cnpj
+    return mapping
+
+
+def load_transactions() -> tuple[dict[str, dict], list[int]]:
+    """(cnpj -> {name, insiders: [...], monthly: {...}}, missing bulk years)
 
     Note: this dataset's "Tipo_Cargo blank" rows (nominally the company's own
     trades) are almost never populated with real trades -- CVM's structured
@@ -586,13 +730,15 @@ def load_transactions() -> dict[str, dict]:
     load_buybacks() instead, which parses the actual filed PDFs.
     """
     companies: dict[str, dict] = {}
+    missing_years: list[int] = []
     for year in YEARS:
         url = VLMO_URL.format(year=year)
         print(f"Downloading {url}")
         try:
             zf = fetch_zip(url)
         except Exception as e:
-            print(f"  skip {year}: {e}")
+            print(f"  skip {year}: {e} -- live search will backfill this year")
+            missing_years.append(year)
             continue
         member = f"vlmo_cia_aberta_con_{year}.csv"
         if member not in zf.namelist():
@@ -626,7 +772,7 @@ def load_transactions() -> dict[str, dict]:
 
     for company in companies.values():
         company["monthly"] = compute_monthly(company["insiders"], by_role=True)
-    return companies
+    return companies, missing_years
 
 
 def _num(value: str):
@@ -771,10 +917,41 @@ def partial_tail_months(coverage: dict[str, int], published: set[str], lookback:
     return sorted(partial)
 
 
+def _filer_counts(by_cnpj: dict, records_key: str) -> collections.Counter:
+    """month -> number of companies that filed for it (one per company, not
+    per trade), the coverage measure used to spot months bulk hasn't
+    finished publishing."""
+    return collections.Counter(
+        month
+        for data in by_cnpj.values()
+        for month in {r["ref"][:7] for r in data.get(records_key, []) if r.get("ref")}
+    )
+
+
 def main():
+    today = datetime.date.today()
+    # Trailing display window: refresh live only within the months the site
+    # shows, so a stale older year never triggers a full re-parse.
+    window_floor = f"{min(YEARS) - 1}-01"
+
     tickers = load_tickers()
-    companies = load_transactions()
-    buybacks, bb_filing_counts = load_buybacks(YEARS, known_cnpjs=set(tickers.keys()))
+    code_to_cnpj = load_code_cnpj_map()
+    companies, ins_missing_years = load_transactions()
+    buybacks, bb_filing_counts, bb_names, bb_missing_years = load_buybacks(
+        YEARS, known_cnpjs=set(tickers.keys()))
+
+    # CVM's bulk exports lag delivery by ~2 days and periodically freeze, so
+    # the newest reference months arrive late or not at all. Replace those
+    # months -- for both tabs -- with CVM's live document search, which
+    # serves filings in real time (the source Fundamentus uses). Bulk stays
+    # authoritative for settled months.
+    insider_bulk_counts = _filer_counts(companies, "insiders")
+    ins_months = months_to_refresh(insider_bulk_counts, ins_missing_years, today, window_floor)
+    bb_months = months_to_refresh(bb_filing_counts, bb_missing_years, today, window_floor)
+    live_filer_counts = refresh_from_live_search(
+        companies, buybacks, bb_names, code_to_cnpj, set(tickers.keys()),
+        ins_months, bb_months, today)
+
     total_shares_by_cnpj = load_total_shares()
     total_shares = {
         "".join(ch for ch in cnpj if ch.isdigit()): shares
@@ -782,15 +959,16 @@ def main():
     }
 
     all_cnpjs = set(companies.keys()) | set(buybacks.keys())
+    # After the live refresh, so a frozen bulk export (which the refresh has
+    # just healed) doesn't read as a data loss and abort the run.
     assert_not_degraded(all_cnpjs, companies, buybacks)
 
-    # Same coverage measure as bb_filing_counts: one per company that filed
-    # for a month, regardless of whether it reported any trades.
-    insider_filing_counts = collections.Counter(
-        month
-        for data in companies.values()
-        for month in {r["ref"][:7] for r in data["insiders"] if r.get("ref")}
-    )
+    # Coverage for the partial-month flag: bulk filer counts, overridden by
+    # the live filer count for any month the refresh replaced.
+    insider_filing_counts = dict(insider_bulk_counts)
+    for (kind, month), count in live_filer_counts.items():
+        target = insider_filing_counts if kind == "insiders" else bb_filing_counts
+        target[month] = max(target.get(month, 0), count)
 
     BY_COMPANY_DIR.mkdir(parents=True, exist_ok=True)
     index = []
